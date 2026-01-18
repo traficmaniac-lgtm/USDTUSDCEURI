@@ -29,17 +29,17 @@ class ScannerTableModel(QAbstractTableModel):
     """Qt table model for scanner results."""
 
     _headers = [
-        "Pair",
-        "Best Buy (Exchange)",
-        "Buy Ask",
-        "Best Sell (Exchange)",
-        "Sell Bid",
-        "Spread $",
-        "Spread %",
-        "24h Volume (median)",
-        "Stable hits (K)",
-        "Score",
-        "Status",
+        "Пара",
+        "Лучшая покупка (биржа)",
+        "Покупка Ask",
+        "Лучшая продажа (биржа)",
+        "Продажа Bid",
+        "Спред $",
+        "Спред %",
+        "Объём 24ч (median)",
+        "Стабильность (K)",
+        "Счёт",
+        "Статус",
     ]
 
     def __init__(self) -> None:
