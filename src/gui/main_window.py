@@ -82,6 +82,8 @@ class MainWindow(QMainWindow):
         self._last_requested_exchanges: list[str] = []
         self._last_requested_pair = ""
         self._log_single_fetch = False
+        self._last_rollup_log_at: datetime | None = None
+        self._status_by_exchange: dict[str, str] = {}
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_quotes)
         self._thread_pool = QThreadPool(self)
@@ -239,7 +241,6 @@ class MainWindow(QMainWindow):
         self._last_requested_pair = pair
         self._last_requested_exchanges = exchanges
         self._updates_count += 1
-        logger.info("tick #{}", self._updates_count)
         self._fetch_in_progress = True
         worker = QuoteFetchWorker(self._price_provider, self._quote_service, pair, exchanges)
         worker.signals.finished.connect(self._handle_quotes)
@@ -247,7 +248,6 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_quotes(self, quotes: list[dict[str, object]]) -> None:
-        logger.info("rows received: {}", len(quotes))
         normalized = self._normalize_quotes(quotes, self._last_requested_exchanges)
         if self._log_single_fetch:
             statuses = [str(item.get("status", "")) for item in normalized]
@@ -257,6 +257,8 @@ class MainWindow(QMainWindow):
             )
             logger.info("Test 1 fetch result | status={} | has_numbers={}", statuses, has_numbers)
             self._log_single_fetch = False
+        self._log_status_changes(normalized)
+        self._log_rollup(normalized)
         self._table_model.update_quotes(normalized)
         self._errors_count = sum(
             1 for quote in normalized if str(quote.get("status", "")).lower() in {"error", "no_symbol"}
@@ -369,6 +371,45 @@ class MainWindow(QMainWindow):
         self._updates_label.setText(f"Updates: {self._updates_count}")
         self._errors_label.setText(f"Errors: {self._errors_count}")
         self._last_update_label.setText(f"Last update: {self._last_update}")
+
+    def _log_rollup(self, quotes: list[dict[str, object]]) -> None:
+        now = datetime.now()
+        if self._last_rollup_log_at and (now - self._last_rollup_log_at).total_seconds() < 5:
+            return
+        ok_count = 0
+        no_symbol_count = 0
+        error_count = 0
+        for quote in quotes:
+            status = str(quote.get("status", "")).upper()
+            if status == "OK":
+                ok_count += 1
+            elif status == "NO_SYMBOL":
+                no_symbol_count += 1
+            elif status in {"ERROR", "TIMEOUT"}:
+                error_count += 1
+        logger.info(
+            "Quote summary | OK={} | NO_SYMBOL={} | ERROR/TIMEOUT={}",
+            ok_count,
+            no_symbol_count,
+            error_count,
+        )
+        self._last_rollup_log_at = now
+
+    def _log_status_changes(self, quotes: list[dict[str, object]]) -> None:
+        for quote in quotes:
+            exchange = str(quote.get("exchange", ""))
+            status = str(quote.get("status", ""))
+            if not exchange:
+                continue
+            previous = self._status_by_exchange.get(exchange)
+            if previous == status:
+                continue
+            self._status_by_exchange[exchange] = status
+            message = str(quote.get("error") or "")
+            if status.upper() in {"ERROR", "TIMEOUT", "NO_SYMBOL"}:
+                logger.warning("Status change | {}: {} -> {} | {}", exchange, previous, status, message)
+            else:
+                logger.info("Status change | {}: {} -> {} | {}", exchange, previous, status, message)
 
     def _set_status(self, status: str) -> None:
         styles = {
