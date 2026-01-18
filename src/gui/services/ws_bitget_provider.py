@@ -12,7 +12,7 @@ from .ws_base import WsProviderBase
 class BitgetWsProvider(WsProviderBase):
     """Stub WebSocket provider for Bitget (not implemented)."""
 
-    ENABLED = False
+    ENABLED = True
 
     def __init__(
         self,

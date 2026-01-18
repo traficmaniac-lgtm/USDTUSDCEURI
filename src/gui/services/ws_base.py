@@ -16,7 +16,7 @@ ErrorCallback = Callable[[str], None]
 class WsProviderBase(threading.Thread):
     """Threaded base class for WebSocket providers."""
 
-    LOG_INTERVAL = timedelta(seconds=10)
+    LOG_INTERVAL = timedelta(seconds=30)
     ENABLED = True
 
     def __init__(

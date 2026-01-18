@@ -107,7 +107,7 @@ class MainWindow(QMainWindow):
         )
         self._build_ui()
         self._setup_logging()
-        self._set_status("Idle")
+        self._set_status("IDLE")
         logger.info("Application started")
         self._refresh_quotes()
 
@@ -229,7 +229,8 @@ class MainWindow(QMainWindow):
             sorted(self._selected_exchanges),
             self._interval_spin.value(),
         )
-        if any(self._ws_manager.supports_exchange(exchange) for exchange in self._selected_exchanges):
+        has_ws = any(self._ws_manager.supports_exchange(exchange) for exchange in self._selected_exchanges)
+        if has_ws:
             self._ensure_http_interval_for_ws()
         self._ws_manager.start_for_selected_exchanges(
             self._pair_combo.currentText(),
@@ -237,8 +238,9 @@ class MainWindow(QMainWindow):
         )
         self._timer.start(self._interval_spin.value())
         self._start_button.setEnabled(False)
+        self._start_button.setText("Running")
         self._stop_button.setEnabled(True)
-        self._set_status("Running")
+        self._set_status("STARTING" if has_ws else "RUNNING")
         logger.info("Streaming started")
 
     def _stop_stream(self) -> None:
@@ -247,8 +249,9 @@ class MainWindow(QMainWindow):
         self._ws_manager.stop_all()
         self._timer.stop()
         self._start_button.setEnabled(True)
+        self._start_button.setText("Start")
         self._stop_button.setEnabled(False)
-        self._set_status("Idle")
+        self._set_status("IDLE")
         logger.info("Streaming stopped")
 
     def _refresh_once(self) -> None:
@@ -296,6 +299,8 @@ class MainWindow(QMainWindow):
     def _handle_ws_quote(self, quote: dict[str, object]) -> None:
         if not self._timer.isActive():
             return
+        if self._status_label.text() == "STARTING":
+            self._set_status("CONNECTED")
         self._table_model.update_exchange_quote(quote)
         self._last_update = datetime.now().strftime("%H:%M:%S")
         self._update_counters()
@@ -446,9 +451,11 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, status: str) -> None:
         styles = {
-            "Idle": "background-color: #edf2f7; color: #2d3748; padding: 4px; border-radius: 4px;",
-            "Running": "background-color: #c6f6d5; color: #22543d; padding: 4px; border-radius: 4px;",
-            "Error": "background-color: #fed7d7; color: #742a2a; padding: 4px; border-radius: 4px;",
+            "IDLE": "background-color: #1f2933; color: #d9e2ec; padding: 4px; border-radius: 4px;",
+            "STARTING": "background-color: #2d3748; color: #fbd38d; padding: 4px; border-radius: 4px;",
+            "RUNNING": "background-color: #22543d; color: #f0fff4; padding: 4px; border-radius: 4px;",
+            "CONNECTED": "background-color: #2f855a; color: #f0fff4; padding: 4px; border-radius: 4px;",
+            "ERROR": "background-color: #742a2a; color: #fff5f5; padding: 4px; border-radius: 4px;",
         }
         self._status_label.setText(status)
         self._status_label.setStyleSheet(styles.get(status, ""))
