@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from loguru import logger
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models.quotes_table_model import QuotesTableModel
+from .services.ccxt_price_provider import CcxtPriceProvider
 from .services.quote_generator import FakeQuoteService
 from .widgets.exchange_selector import ExchangeSelectorDialog
 from .widgets.log_panel import LogPanel
@@ -31,6 +32,39 @@ class LogEmitter(QObject):
     message = Signal(str, str)
 
 
+class QuoteFetchSignals(QObject):
+    """Signals for quote fetching worker."""
+
+    finished = Signal(list)
+    error = Signal(str)
+
+
+class QuoteFetchWorker(QRunnable):
+    """Background worker for fetching quotes."""
+
+    def __init__(
+        self,
+        provider: CcxtPriceProvider,
+        fallback: FakeQuoteService,
+        pair: str,
+        exchanges: list[str],
+    ) -> None:
+        super().__init__()
+        self._provider = provider
+        self._fallback = fallback
+        self._pair = pair
+        self._exchanges = exchanges
+        self.signals = QuoteFetchSignals()
+
+    def run(self) -> None:
+        try:
+            quotes = self._provider.fetch_quotes(self._pair, self._exchanges)
+        except Exception as exc:
+            quotes = self._fallback.generate(self._pair, self._exchanges)
+            self.signals.error.emit(str(exc))
+        self.signals.finished.emit(quotes)
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
@@ -38,23 +72,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("USDTUSDCEURI")
         self.resize(1200, 800)
-        self._exchanges = [
-            "Binance",
-            "Coinbase",
-            "Kraken",
-            "Bybit",
-            "OKX",
-            "KuCoin",
-            "Bitfinex",
-            "Gate.io",
-            "Bitget",
-            "Huobi",
-            "Gemini",
-            "Bittrex",
-            "Poloniex",
-            "MEXC",
-            "Crypto.com",
-        ]
+        self._price_provider = CcxtPriceProvider()
+        self._exchanges = self._price_provider.supported_exchanges()
         self._selected_exchanges = set(self._exchanges)
         self._quote_service = FakeQuoteService()
         self._updates_count = 0
@@ -62,6 +81,8 @@ class MainWindow(QMainWindow):
         self._last_update = "—"
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_quotes)
+        self._thread_pool = QThreadPool(self)
+        self._fetch_in_progress = False
         self._log_emitter = LogEmitter()
         self._build_ui()
         self._setup_logging()
@@ -201,14 +222,26 @@ class MainWindow(QMainWindow):
         logger.info("Manual refresh triggered")
 
     def _refresh_quotes(self) -> None:
+        if self._fetch_in_progress:
+            return
         pair = self._pair_combo.currentText()
         exchanges = list(self._selected_exchanges)
-        quotes = self._quote_service.generate(pair, exchanges)
+        self._fetch_in_progress = True
+        worker = QuoteFetchWorker(self._price_provider, self._quote_service, pair, exchanges)
+        worker.signals.finished.connect(self._handle_quotes)
+        worker.signals.error.connect(self._handle_fetch_error)
+        self._thread_pool.start(worker)
+
+    def _handle_quotes(self, quotes: list[dict[str, object]]) -> None:
         self._table_model.update_quotes(quotes)
         self._updates_count += 1
-        self._errors_count = sum(1 for quote in quotes if quote.get("status") == "Error")
+        self._errors_count = sum(1 for quote in quotes if str(quote.get("status", "")).lower() == "error")
         self._last_update = datetime.now().strftime("%H:%M:%S")
         self._update_counters()
+        self._fetch_in_progress = False
+
+    def _handle_fetch_error(self, message: str) -> None:
+        logger.warning("Falling back to fake quotes: {}", message)
 
     def _update_interval(self) -> None:
         if self._timer.isActive():
