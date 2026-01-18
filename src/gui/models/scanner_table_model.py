@@ -13,15 +13,15 @@ class ScannerRow:
     """Container for a scanner row."""
 
     pair: str
-    best_buy_exchange: str
-    buy_ask: float
-    best_sell_exchange: str
-    sell_bid: float
-    spread_abs: float
-    spread_pct: float
-    volume_24h: float
-    stable_hits: int
-    score: float
+    best_buy_exchange: str | None
+    buy_ask: float | None
+    best_sell_exchange: str | None
+    sell_bid: float | None
+    spread_abs: float | None
+    spread_pct: float | None
+    volume_24h: float | None
+    stable_hits: int | None
+    score: float | None
     status: str
 
 
@@ -100,23 +100,23 @@ class ScannerTableModel(QAbstractTableModel):
         if column == 0:
             return row.pair
         if column == 1:
-            return row.best_buy_exchange
+            return row.best_buy_exchange or "—"
         if column == 2:
-            return f"{row.buy_ask:.6f}"
+            return "—" if row.buy_ask is None else f"{row.buy_ask:.6f}"
         if column == 3:
-            return row.best_sell_exchange
+            return row.best_sell_exchange or "—"
         if column == 4:
-            return f"{row.sell_bid:.6f}"
+            return "—" if row.sell_bid is None else f"{row.sell_bid:.6f}"
         if column == 5:
-            return f"{row.spread_abs:.6f}"
+            return "—" if row.spread_abs is None else f"{row.spread_abs:.6f}"
         if column == 6:
-            return f"{row.spread_pct:.4f}%"
+            return "—" if row.spread_pct is None else f"{row.spread_pct:.4f}%"
         if column == 7:
-            return f"{row.volume_24h:,.0f}"
+            return "—" if row.volume_24h is None else f"{row.volume_24h:,.0f}"
         if column == 8:
-            return str(row.stable_hits)
+            return "—" if row.stable_hits is None else str(row.stable_hits)
         if column == 9:
-            return f"{row.score:.2f}"
+            return "—" if row.score is None else f"{row.score:.2f}"
         if column == 10:
             return row.status
         return ""

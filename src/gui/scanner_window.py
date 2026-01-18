@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import random
-from dataclasses import replace
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -26,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models.scanner_table_model import ScannerRow, ScannerTableModel
+from ..scanner.market_discovery import MarketDiscoveryResult, MarketDiscoveryService
 
 
 class ScannerWindow(QMainWindow):
@@ -44,40 +43,18 @@ class ScannerWindow(QMainWindow):
         "HTX",
     ]
 
-    _base_assets = [
-        "BTC",
-        "ETH",
-        "SOL",
-        "XRP",
-        "ADA",
-        "DOGE",
-        "TRX",
-        "DOT",
-        "AVAX",
-        "MATIC",
-        "TON",
-        "ATOM",
-        "LTC",
-        "BCH",
-        "LINK",
-        "ETC",
-        "NEAR",
-        "APT",
-        "ARB",
-        "OP",
-    ]
-
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Scanner Mode")
         self.resize(1200, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._update_fake_rows)
         self._rows: list[ScannerRow] = []
         self._scanning = False
         self._last_updated = "—"
+        self._discovery_thread: QThread | None = None
+        self._discovery_worker: MarketDiscoveryWorker | None = None
+        self._discovery_request_id = 0
 
         self._build_ui()
         self._log("Scanner window opened")
@@ -135,7 +112,6 @@ class ScannerWindow(QMainWindow):
 
         self._scan_interval_spin = self._make_spinbox(250, 10_000, 2000)
         self._scan_interval_spin.setSuffix(" ms")
-        self._scan_interval_spin.valueChanged.connect(self._update_timer_interval)
         grid_layout.addLayout(self._labeled_row("Scan interval (ms):", self._scan_interval_spin))
 
         outer_layout.addLayout(grid_layout)
@@ -251,22 +227,25 @@ class ScannerWindow(QMainWindow):
         return selected or [self._exchange_names[0]]
 
     def _start_scan(self) -> None:
-        if self._timer.isActive():
+        if self._scanning:
             return
-        self._rows = self._generate_fake_rows()
-        self._table_model.set_rows(self._rows)
-        self._timer.start(self._scan_interval_spin.value())
+        selected_exchanges = self._selected_exchanges()
+        quotes = self._selected_quote_currencies()
+        min_exchanges = self._min_exchanges_spin.value()
+        self._rows = []
+        self._table_model.set_rows([])
         self._scanning = True
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
-        self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._log("Start Scan clicked")
+        self._log(f"Loading markets for {len(selected_exchanges)} exchanges...")
         self._update_status()
+        self._start_market_discovery(selected_exchanges, quotes, min_exchanges)
 
     def _stop_scan(self) -> None:
-        if not self._timer.isActive():
+        if not self._scanning:
             return
-        self._timer.stop()
+        self._cancel_market_discovery()
         self._scanning = False
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
@@ -274,7 +253,7 @@ class ScannerWindow(QMainWindow):
         self._update_status()
 
     def _clear_scan(self) -> None:
-        self._timer.stop()
+        self._cancel_market_discovery()
         self._rows = []
         self._table_model.set_rows([])
         self._scanning = False
@@ -296,87 +275,75 @@ class ScannerWindow(QMainWindow):
         if pairs:
             self._log(f"Selected pairs: {', '.join(pairs)}")
 
-    def _update_fake_rows(self) -> None:
-        if not self._rows:
+    def _start_market_discovery(
+        self,
+        exchanges: list[str],
+        quotes: list[str],
+        min_exchanges: int,
+    ) -> None:
+        self._discovery_request_id += 1
+        request_id = self._discovery_request_id
+        self._discovery_worker = MarketDiscoveryWorker(
+            request_id=request_id,
+            exchanges=exchanges,
+            quotes=quotes,
+            min_exchanges=min_exchanges,
+        )
+        self._discovery_thread = QThread(self)
+        self._discovery_worker.moveToThread(self._discovery_thread)
+        self._discovery_thread.started.connect(self._discovery_worker.run)
+        self._discovery_worker.log.connect(self._log)
+        self._discovery_worker.finished.connect(self._on_discovery_finished)
+        self._discovery_worker.failed.connect(self._on_discovery_failed)
+        self._discovery_worker.finished.connect(self._discovery_thread.quit)
+        self._discovery_worker.failed.connect(self._discovery_thread.quit)
+        self._discovery_thread.finished.connect(self._discovery_worker.deleteLater)
+        self._discovery_thread.finished.connect(self._discovery_thread.deleteLater)
+        self._discovery_thread.start()
+
+    def _cancel_market_discovery(self) -> None:
+        if self._discovery_worker:
+            self._discovery_worker.cancel()
+        self._discovery_request_id += 1
+
+    def _on_discovery_finished(self, request_id: int, result: MarketDiscoveryResult) -> None:
+        if request_id != self._discovery_request_id:
             return
-        for index, row in enumerate(self._rows):
-            spread_pct = max(0.01, row.spread_pct + random.uniform(-0.05, 0.08))
-            score = max(0.0, min(100.0, row.score + random.uniform(-2.0, 2.5)))
-            spread_abs = max(0.0, row.buy_ask * (spread_pct / 100))
-            status = self._pick_status(spread_pct, score)
-            self._rows[index] = replace(
-                row,
-                spread_pct=spread_pct,
-                spread_abs=spread_abs,
-                score=score,
-                status=status,
+        for exchange, count in result.exchange_counts.items():
+            self._log(f"Markets loaded: {exchange}={count}")
+        min_exchanges = self._min_exchanges_spin.value()
+        self._log(f"Eligible pairs: {len(result.eligible_pairs)} (min exchanges={min_exchanges})")
+        self._rows = [
+            ScannerRow(
+                pair=pair,
+                best_buy_exchange=None,
+                buy_ask=None,
+                best_sell_exchange=None,
+                sell_bid=None,
+                spread_abs=None,
+                spread_pct=None,
+                volume_24h=None,
+                stable_hits=None,
+                score=None,
+                status=f"eligible ({len(result.pair_exchanges.get(pair, []))})",
             )
-        self._table_model.notify_rows_updated()
+            for pair in result.eligible_pairs
+        ]
+        self._table_model.set_rows(self._rows)
+        self._scanning = False
+        self._start_button.setEnabled(True)
+        self._stop_button.setEnabled(False)
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
 
-    def _pick_status(self, spread_pct: float, score: float) -> str:
-        if spread_pct > 1.0 or score > 70:
-            return "HOT"
-        if spread_pct > 0.5:
-            return "TRACKING"
-        return "WARM"
-
-    def _generate_fake_rows(self) -> list[ScannerRow]:
-        count = random.randint(10, 20)
-        quotes = self._selected_quote_currencies()
-        exchanges = self._selected_exchanges()
-        rows: list[ScannerRow] = []
-        for _ in range(count):
-            base = random.choice(self._base_assets)
-            quote = random.choice(quotes)
-            pair = f"{base}/{quote}"
-            if len(exchanges) > 1:
-                buy_exchange, sell_exchange = random.sample(exchanges, k=2)
-            else:
-                buy_exchange = sell_exchange = exchanges[0]
-            price = self._base_price_for_asset(base)
-            buy_ask = price * random.uniform(0.995, 1.005)
-            sell_bid = buy_ask * random.uniform(1.0005, 1.015)
-            spread_abs = max(0.0, sell_bid - buy_ask)
-            spread_pct = max(0.01, (spread_abs / buy_ask) * 100)
-            volume = random.uniform(120_000, 8_500_000)
-            stable_hits = random.randint(1, 6)
-            score = random.uniform(15.0, 85.0)
-            status = self._pick_status(spread_pct, score)
-            rows.append(
-                ScannerRow(
-                    pair=pair,
-                    best_buy_exchange=buy_exchange,
-                    buy_ask=buy_ask,
-                    best_sell_exchange=sell_exchange,
-                    sell_bid=sell_bid,
-                    spread_abs=spread_abs,
-                    spread_pct=spread_pct,
-                    volume_24h=volume,
-                    stable_hits=stable_hits,
-                    score=score,
-                    status=status,
-                )
-            )
-        return rows
-
-    def _base_price_for_asset(self, base: str) -> float:
-        if base in {"BTC"}:
-            return random.uniform(25_000, 65_000)
-        if base in {"ETH"}:
-            return random.uniform(1_600, 4_500)
-        if base in {"SOL", "LTC", "BCH"}:
-            return random.uniform(40, 220)
-        if base in {"AVAX", "DOT", "ATOM", "NEAR", "APT"}:
-            return random.uniform(5, 60)
-        if base in {"XRP", "ADA", "DOGE", "TRX"}:
-            return random.uniform(0.08, 1.2)
-        return random.uniform(0.5, 10)
-
-    def _update_timer_interval(self) -> None:
-        if self._timer.isActive():
-            self._timer.start(self._scan_interval_spin.value())
+    def _on_discovery_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._discovery_request_id:
+            return
+        self._log(f"Market discovery error: {message}")
+        self._scanning = False
+        self._start_button.setEnabled(True)
+        self._stop_button.setEnabled(False)
+        self._update_status()
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -390,7 +357,51 @@ class ScannerWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self._timer.stop()
+        self._cancel_market_discovery()
         self._scanning = False
         self._update_status()
         super().closeEvent(event)
+
+
+class MarketDiscoveryWorker(QObject):
+    """Background worker for market discovery."""
+
+    finished = Signal(int, MarketDiscoveryResult)
+    failed = Signal(int, str)
+    log = Signal(str)
+
+    def __init__(
+        self,
+        request_id: int,
+        exchanges: list[str],
+        quotes: list[str],
+        min_exchanges: int,
+    ) -> None:
+        super().__init__()
+        self._request_id = request_id
+        self._exchanges = exchanges
+        self._quotes = quotes
+        self._min_exchanges = min_exchanges
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            service = MarketDiscoveryService()
+            result = service.discover(
+                self._exchanges,
+                self._quotes,
+                self._min_exchanges,
+                should_cancel=self._is_cancelled,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface discovery errors in UI
+            self.failed.emit(self._request_id, str(exc))
+            return
+        if self._cancelled:
+            return
+        self.finished.emit(self._request_id, result)
+
+    def _is_cancelled(self) -> bool:
+        return self._cancelled
