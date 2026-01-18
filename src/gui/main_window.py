@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from .models.arbitrage_table_model import ArbitrageTableModel, OpportunityRow
 from .models.quotes_table_model import QuotesTableModel
+from .scanner_window import ScannerWindow
 from .services.arbitrage_analyzer import ArbitrageResult, analyze
 from .services.ccxt_price_provider import CcxtPriceProvider
 from .services.quote_generator import FakeQuoteService
@@ -113,6 +114,7 @@ class MainWindow(QMainWindow):
         self._quotes_by_exchange: dict[str, dict[str, object]] = {}
         self._last_arbitrage_key: tuple[str, str] | None = None
         self._last_arbitrage_spread_pct: float | None = None
+        self._scanner_window: ScannerWindow | None = None
         self._build_ui()
         self._setup_logging()
         self._set_status("IDLE")
@@ -261,6 +263,11 @@ class MainWindow(QMainWindow):
         open_logs_action.triggered.connect(self._open_logs_folder)
         settings_menu.addAction(open_logs_action)
 
+        tools_menu = self.menuBar().addMenu("Tools")
+        scanner_action = QAction("Scanner Mode", self)
+        scanner_action.triggered.connect(self._open_scanner_window)
+        tools_menu.addAction(scanner_action)
+
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About", self)
         about_action.triggered.connect(self._show_about)
@@ -273,6 +280,18 @@ class MainWindow(QMainWindow):
 
         logger.add(sink, level="INFO")
         self._log_emitter.message.connect(self._log_panel.append_log)
+
+    def _open_scanner_window(self) -> None:
+        if self._scanner_window is None:
+            self._scanner_window = ScannerWindow()
+            self._scanner_window.destroyed.connect(self._on_scanner_closed)
+            self._scanner_window.show()
+        else:
+            self._scanner_window.raise_()
+            self._scanner_window.activateWindow()
+
+    def _on_scanner_closed(self, _obj: object | None = None) -> None:
+        self._scanner_window = None
 
     def _start_stream(self) -> None:
         if self._timer.isActive():
