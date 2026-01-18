@@ -54,13 +54,16 @@ class MarketDiscoveryService:
         quotes: Iterable[str],
         min_exchanges: int,
         should_cancel: Callable[[], bool] | None = None,
+        progress_cb: Callable[[int, int], None] | None = None,
     ) -> MarketDiscoveryResult:
         """Load markets and return eligible pairs."""
+        exchanges_list = list(exchanges)
         quotes_set = {quote.upper() for quote in quotes}
         pair_exchanges: dict[str, set[str]] = {}
         exchange_counts: dict[str, int] = {}
 
-        for exchange_label in exchanges:
+        total = len(exchanges_list)
+        for index, exchange_label in enumerate(exchanges_list, start=1):
             if should_cancel and should_cancel():
                 break
             exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
@@ -86,6 +89,8 @@ class MarketDiscoveryService:
             exchange_counts[exchange_label] = len(filtered)
             for symbol in filtered:
                 pair_exchanges.setdefault(symbol, set()).add(exchange_label)
+            if progress_cb:
+                progress_cb(index, total)
 
         eligible_pairs = [
             pair
