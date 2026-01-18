@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -52,7 +51,7 @@ class ScannerWindow(QMainWindow):
         self.resize(1200, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
-        self._rows: list[ScannerRow] = []
+        self._eligible_pairs: list[str] = []
         self._profit_rows: list[ScannerRow] = []
         self._scanning = False
         self._last_updated = "—"
@@ -62,6 +61,7 @@ class ScannerWindow(QMainWindow):
         self._ticker_thread: QThread | None = None
         self._ticker_worker: TickerScanWorker | None = None
         self._pair_exchanges: dict[str, list[str]] = {}
+        self._selected_exchanges_count = 0
 
         self._build_ui()
         self._log("Окно сканера открыто")
@@ -72,8 +72,7 @@ class ScannerWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.addWidget(self._build_settings_panel())
         layout.addLayout(self._build_controls())
-        layout.addLayout(self._build_transfer_controls())
-        layout.addWidget(self._build_tables_splitter())
+        layout.addWidget(self._build_profit_panel())
         layout.addLayout(self._build_status_log())
         self.setCentralWidget(central)
         self._create_actions()
@@ -155,47 +154,6 @@ class ScannerWindow(QMainWindow):
         layout.addWidget(self._clear_button)
         layout.addStretch()
         return layout
-
-    def _build_transfer_controls(self) -> QHBoxLayout:
-        layout = QHBoxLayout()
-        self._add_profit_button = QPushButton("Добавить →")
-        self._remove_profit_button = QPushButton("← Убрать")
-        self._open_analysis_button = QPushButton("Открыть анализ")
-
-        self._add_profit_button.clicked.connect(self._add_to_profit)
-        self._remove_profit_button.clicked.connect(self._remove_from_profit)
-        self._open_analysis_button.clicked.connect(self._open_analysis)
-
-        layout.addStretch()
-        layout.addWidget(self._add_profit_button)
-        layout.addWidget(self._remove_profit_button)
-        layout.addWidget(self._open_analysis_button)
-        layout.addStretch()
-        return layout
-
-    def _build_tables_splitter(self) -> QSplitter:
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_candidates_panel())
-        splitter.addWidget(self._build_profit_panel())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        return splitter
-
-    def _build_candidates_panel(self) -> QGroupBox:
-        group = QGroupBox("Все пары")
-        layout = QVBoxLayout(group)
-        self._table_model = ScannerTableModel()
-        self._table_view = QTableView()
-        self._proxy_model = self._create_proxy_model(self._table_model)
-        self._table_view.setModel(self._proxy_model)
-        self._table_view.setSortingEnabled(True)
-        self._table_view.setAlternatingRowColors(True)
-        self._table_view.horizontalHeader().setStretchLastSection(True)
-        self._table_view.horizontalHeader().setDefaultSectionSize(130)
-        self._table_view.setSelectionBehavior(QTableView.SelectRows)
-        self._table_view.setSelectionMode(QTableView.ExtendedSelection)
-        layout.addWidget(self._table_view)
-        return group
 
     def _build_profit_panel(self) -> QGroupBox:
         group = QGroupBox("Профитные")
@@ -282,9 +240,9 @@ class ScannerWindow(QMainWindow):
         selected_exchanges = self._selected_exchanges()
         quotes = self._selected_quote_currencies()
         min_exchanges = self._min_exchanges_spin.value()
-        self._rows = []
+        self._selected_exchanges_count = len(selected_exchanges)
+        self._eligible_pairs = []
         self._pair_exchanges = {}
-        self._table_model.set_rows([])
         self._profit_rows = []
         self._profit_table_model.set_rows([])
         self._scanning = True
@@ -309,9 +267,8 @@ class ScannerWindow(QMainWindow):
     def _clear_scan(self) -> None:
         self._cancel_market_discovery()
         self._stop_ticker_scan()
-        self._rows = []
+        self._eligible_pairs = []
         self._pair_exchanges = {}
-        self._table_model.set_rows([])
         self._profit_rows = []
         self._profit_table_model.set_rows([])
         self._scanning = False
@@ -321,62 +278,24 @@ class ScannerWindow(QMainWindow):
         self._log("Данные очищены")
         self._update_status()
 
-    def _add_to_profit(self) -> None:
-        selection = self._table_view.selectionModel()
-        rows = selection.selectedRows() if selection else []
-        if not rows:
-            return
-        existing_pairs = {row.pair for row in self._profit_rows}
-        added_rows: list[ScannerRow] = []
-        for proxy_index in rows:
-            source_index = self._proxy_model.mapToSource(proxy_index)
-            if 0 <= source_index.row() < len(self._rows):
-                row = self._rows[source_index.row()]
-                if row.pair not in existing_pairs:
-                    existing_pairs.add(row.pair)
-                    added_rows.append(row)
-        if not added_rows:
-            self._log("Профитные пары уже содержат выбранные элементы")
-            return
-        self._profit_rows.extend(added_rows)
-        self._profit_table_model.set_rows(self._profit_rows)
-        self._log(f"Добавлено в профитные: {len(added_rows)}")
-        self._update_status()
-
-    def _remove_from_profit(self) -> None:
-        selection = self._profit_table_view.selectionModel()
-        rows = selection.selectedRows() if selection else []
-        if not rows:
-            return
-        selected_pairs = set()
-        for proxy_index in rows:
-            source_index = self._profit_proxy_model.mapToSource(proxy_index)
-            if 0 <= source_index.row() < len(self._profit_rows):
-                selected_pairs.add(self._profit_rows[source_index.row()].pair)
-        if not selected_pairs:
-            return
-        before_count = len(self._profit_rows)
-        self._profit_rows = [row for row in self._profit_rows if row.pair not in selected_pairs]
-        self._profit_table_model.set_rows(self._profit_rows)
-        removed_count = before_count - len(self._profit_rows)
-        self._log(f"Удалено из профитных: {removed_count}")
-        self._update_status()
-
-    def _open_analysis(self, _index=None) -> None:
-        selection = self._profit_table_view.selectionModel()
-        rows = selection.selectedRows() if selection else []
-        if not rows:
-            return
-        proxy_index = rows[0]
+    def _open_analysis(self, index=None) -> None:
+        if index is None:
+            selection = self._profit_table_view.selectionModel()
+            rows = selection.selectedRows() if selection else []
+            if not rows:
+                return
+            proxy_index = rows[0]
+        else:
+            proxy_index = index
         source_index = self._profit_proxy_model.mapToSource(proxy_index)
         if not (0 <= source_index.row() < len(self._profit_rows)):
             return
         pair = self._profit_rows[source_index.row()].pair
-        self._log(f"Запрос на открытие анализа: {pair}")
+        self._log(f"Открыть анализ: {pair}")
         QMessageBox.information(
             self,
             "Анализ пары",
-            "Окно анализа будет добавлено на этапе 6.2.4",
+            "Окно анализа будет добавлено на следующем этапе",
         )
 
     def _start_market_discovery(
@@ -420,27 +339,20 @@ class ScannerWindow(QMainWindow):
             f"Кандидаты: {len(result.eligible_pairs)} (мин. бирж={min_exchanges})"
         )
         self._pair_exchanges = result.pair_exchanges
-        self._rows = [
-            ScannerRow(
-                pair=pair,
-                best_buy_exchange=None,
-                buy_ask=None,
-                best_sell_exchange=None,
-                sell_bid=None,
-                spread_abs=None,
-                spread_pct=None,
-                volume_24h=None,
-                stable_hits=None,
-                score=None,
-                status="—",
-            )
-            for pair in result.eligible_pairs
-        ]
-        self._table_model.set_rows(self._rows)
+        self._eligible_pairs = list(result.eligible_pairs)
         self._profit_rows = []
         self._profit_table_model.set_rows([])
         if self._scanning:
-            self._start_ticker_scan()
+            min_exchanges = self._min_exchanges_spin.value()
+            if not self._eligible_pairs:
+                self._log("Скан цен не запущен: нет eligible пар")
+            elif self._selected_exchanges_count < min_exchanges:
+                self._log(
+                    "Скан цен не запущен: выберите больше бирж "
+                    f"(нужно >= {min_exchanges})"
+                )
+            else:
+                self._start_ticker_scan()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
 
@@ -460,6 +372,7 @@ class ScannerWindow(QMainWindow):
         max_pairs = self._max_pairs_spin.value()
         self._ticker_worker = TickerScanWorker(
             pair_exchanges=self._pair_exchanges,
+            eligible_pairs=self._eligible_pairs,
             max_pairs=max_pairs,
             interval_ms=interval_ms,
         )
@@ -472,7 +385,11 @@ class ScannerWindow(QMainWindow):
         self._ticker_thread.finished.connect(self._ticker_worker.deleteLater)
         self._ticker_thread.finished.connect(self._ticker_thread.deleteLater)
         self._ticker_thread.start()
-        self._log("Сканирование тикеров запущено")
+        pairs_count = min(max_pairs, len(self._eligible_pairs))
+        self._log(
+            "Скан цен запущен: "
+            f"pairs={pairs_count} exchanges={self._selected_exchanges_count}"
+        )
 
     def _stop_ticker_scan(self) -> None:
         if self._ticker_worker:
@@ -481,28 +398,56 @@ class ScannerWindow(QMainWindow):
         self._ticker_worker = None
 
     def _on_ticker_updated(self, result: TickerScanResult) -> None:
-        if not self._rows:
+        if not self._scanning:
             return
-        row_map = {row.pair: row for row in self._rows}
+        threshold = self._opportunity_threshold_spin.value()
+        row_map = {row.pair: row for row in self._profit_rows}
         for update in result.updates:
-            row = row_map.get(update.pair)
-            if not row:
-                continue
-            row.best_buy_exchange = update.best_buy_exchange
-            row.buy_ask = update.buy_ask
-            row.best_sell_exchange = update.best_sell_exchange
-            row.sell_bid = update.sell_bid
-            row.spread_abs = update.spread_abs
-            row.spread_pct = update.spread_pct
-            row.volume_24h = update.volume_24h
-            row.status = "—"
-        self._table_model.notify_rows_updated()
-        self._profit_table_model.notify_rows_updated()
+            spread_pct = update.spread_pct
+            if spread_pct is not None and spread_pct >= threshold:
+                row = row_map.get(update.pair)
+                if row is None:
+                    row = ScannerRow(
+                        pair=update.pair,
+                        best_buy_exchange=update.best_buy_exchange,
+                        buy_ask=update.buy_ask,
+                        best_sell_exchange=update.best_sell_exchange,
+                        sell_bid=update.sell_bid,
+                        spread_abs=update.spread_abs,
+                        spread_pct=update.spread_pct,
+                        volume_24h=update.volume_24h,
+                        stable_hits=None,
+                        score=None,
+                        status="LIVE",
+                    )
+                    self._profit_rows.append(row)
+                    row_map[update.pair] = row
+                else:
+                    row.best_buy_exchange = update.best_buy_exchange
+                    row.buy_ask = update.buy_ask
+                    row.best_sell_exchange = update.best_sell_exchange
+                    row.sell_bid = update.sell_bid
+                    row.spread_abs = update.spread_abs
+                    row.spread_pct = update.spread_pct
+                    row.volume_24h = update.volume_24h
+                    row.status = "LIVE"
+            else:
+                row = row_map.get(update.pair)
+                if row:
+                    row.best_buy_exchange = update.best_buy_exchange
+                    row.buy_ask = update.buy_ask
+                    row.best_sell_exchange = update.best_sell_exchange
+                    row.sell_bid = update.sell_bid
+                    row.spread_abs = update.spread_abs
+                    row.spread_pct = update.spread_pct
+                    row.volume_24h = update.volume_24h
+                    row.status = "УГАСЛО"
+        self._profit_table_model.set_rows(self._profit_rows)
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
         self._log(
-            "Обновление тикеров: "
-            f"пар={result.pair_count} ok={result.ok_count} fail={result.fail_count}"
+            "Обновление: "
+            f"ok={result.ok_count} fail={result.fail_count}"
         )
 
     def _log(self, message: str) -> None:
@@ -511,11 +456,11 @@ class ScannerWindow(QMainWindow):
 
     def _update_status(self) -> None:
         scanning_state = "ВКЛ" if self._scanning else "ВЫКЛ"
-        candidates = len(self._rows)
+        eligible = len(self._eligible_pairs)
         profit_count = len(self._profit_rows)
         self._status_label.setText(
             "Сканирование: "
-            f"{scanning_state} | Кандидаты: {candidates} | "
+            f"{scanning_state} | Eligible: {eligible} | "
             f"Профитные: {profit_count} | Обновлено: {self._last_updated}"
         )
 
@@ -581,11 +526,13 @@ class TickerScanWorker(QObject):
     def __init__(
         self,
         pair_exchanges: dict[str, list[str]],
+        eligible_pairs: list[str],
         max_pairs: int,
         interval_ms: int,
     ) -> None:
         super().__init__()
         self._pair_exchanges = pair_exchanges
+        self._eligible_pairs = eligible_pairs
         self._max_pairs = max_pairs
         self._interval_ms = interval_ms
         self._timer: QTimer | None = None
@@ -610,7 +557,11 @@ class TickerScanWorker(QObject):
             return
         try:
             service = TickerScanService()
-            result = service.scan(self._pair_exchanges, self._max_pairs)
+            result = service.scan(
+                self._pair_exchanges,
+                self._max_pairs,
+                pairs=self._eligible_pairs,
+            )
         except Exception as exc:  # noqa: BLE001 - surface scan errors
             self.log.emit(f"Ошибка сканирования тикеров: {exc}")
             return

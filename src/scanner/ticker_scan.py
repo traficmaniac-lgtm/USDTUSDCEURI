@@ -57,16 +57,20 @@ class TickerScanService:
         self,
         pair_exchanges: dict[str, list[str]],
         max_pairs: int,
+        pairs: list[str] | None = None,
     ) -> TickerScanResult:
         """Fetch tickers for the given pairs and compute spreads."""
-        pairs = sorted(pair_exchanges.keys())[:max_pairs]
+        if pairs is None:
+            pairs_to_scan = sorted(pair_exchanges.keys())[:max_pairs]
+        else:
+            pairs_to_scan = list(pairs)[:max_pairs]
         exchanges_cache: dict[str, ccxt.Exchange] = {}
         updates: list[TickerScanUpdate] = []
         errors: list[str] = []
         ok_count = 0
         fail_count = 0
 
-        for pair in pairs:
+        for pair in pairs_to_scan:
             asks: list[tuple[float, str]] = []
             bids: list[tuple[float, str]] = []
             volumes: list[float] = []
@@ -109,7 +113,7 @@ class TickerScanService:
 
         return TickerScanResult(
             updates=updates,
-            pair_count=len(pairs),
+            pair_count=len(pairs_to_scan),
             ok_count=ok_count,
             fail_count=fail_count,
             errors=errors,
