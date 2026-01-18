@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import time
 
-from PySide6.QtCore import QObject, QTimer, Qt, QThread, Signal
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from .models.scanner_table_model import ScannerRow, ScannerTableModel
 from .pair_analysis_window import PairAnalysisWindow
+from ..core.update_controller import get_update_controller
 from ..scanner.market_discovery import MarketDiscoveryResult, MarketDiscoveryService
 from ..scanner.ticker_scan import TickerScanResult, TickerScanService
 
@@ -58,15 +59,14 @@ class ScannerWindow(QMainWindow):
         self._profit_rows: list[ScannerRow] = []
         self._scanning = False
         self._last_updated = "—"
-        self._discovery_thread: QThread | None = None
-        self._discovery_worker: MarketDiscoveryWorker | None = None
+        self._discovery_job = None
         self._discovery_request_id = 0
-        self._ticker_thread: QThread | None = None
-        self._ticker_worker: TickerScanWorker | None = None
+        self._scan_job = None
         self._pair_exchanges: dict[str, list[str]] = {}
         self._selected_exchanges_count = 0
         self._analysis_windows: dict[str, PairAnalysisWindow] = {}
         self._last_scan_ts: float | None = None
+        self._last_scan_duration_ms: float | None = None
         self._heartbeat_timer: QTimer | None = None
         self._discovery_total_exchanges = 0
         self._scan_timer: QTimer | None = None
@@ -74,6 +74,11 @@ class ScannerWindow(QMainWindow):
         self._scan_in_flight = False
         self._stage = "STOP"
         self._heartbeat_phase = 0
+        self._scan_backoff_s = 0.0
+        self._last_scan_ok = 0
+        self._last_scan_fail = 0
+        self._next_scan_eta_s: float | None = None
+        self._update_controller = get_update_controller()
 
         self._build_ui()
         self._start_heartbeat_timer()
@@ -371,29 +376,24 @@ class ScannerWindow(QMainWindow):
     ) -> None:
         self._discovery_request_id += 1
         request_id = self._discovery_request_id
-        self._discovery_worker = MarketDiscoveryWorker(
-            request_id=request_id,
-            exchanges=exchanges,
-            quotes=quotes,
-            min_exchanges=min_exchanges,
+        self._discovery_job = self._update_controller.submit(
+            key="scanner-discovery",
+            run_id=request_id,
+            task=lambda: MarketDiscoveryService().discover(
+                exchanges,
+                quotes,
+                min_exchanges,
+            ),
         )
-        self._discovery_thread = QThread(self)
-        self._discovery_worker.moveToThread(self._discovery_thread)
-        self._discovery_thread.started.connect(self._discovery_worker.run)
-        self._discovery_worker.log.connect(self._log)
-        self._discovery_worker.progress.connect(self._on_discovery_progress)
-        self._discovery_worker.finished.connect(self._on_discovery_finished)
-        self._discovery_worker.failed.connect(self._on_discovery_failed)
-        self._discovery_worker.finished.connect(self._discovery_thread.quit)
-        self._discovery_worker.failed.connect(self._discovery_thread.quit)
-        self._discovery_thread.finished.connect(self._discovery_worker.deleteLater)
-        self._discovery_thread.finished.connect(self._discovery_thread.deleteLater)
-        self._discovery_thread.start()
+        if not self._discovery_job:
+            self._log("Market discovery already in progress")
+            return
+        self._discovery_job.succeeded.connect(self._on_discovery_finished)
+        self._discovery_job.failed.connect(self._on_discovery_failed)
 
     def _cancel_market_discovery(self) -> None:
-        if self._discovery_worker:
-            self._discovery_worker.cancel()
         self._discovery_request_id += 1
+        self._update_controller.clear_key("scanner-discovery")
 
     def _on_discovery_finished(self, request_id: int, result: MarketDiscoveryResult) -> None:
         if request_id != self._discovery_request_id:
@@ -455,9 +455,9 @@ class ScannerWindow(QMainWindow):
         )
 
     def _stop_ticker_scan(self) -> None:
-        self._ticker_worker = None
-        self._ticker_thread = None
+        self._scan_job = None
         self._scan_in_flight = False
+        self._scan_backoff_s = 0.0
         if self._scan_timer:
             self._scan_timer.stop()
 
@@ -465,31 +465,38 @@ class ScannerWindow(QMainWindow):
         if not self._scanning or self._scan_in_flight:
             return
         self._scan_in_flight = True
-        worker = ScannerUpdateWorker(
+        scan_started = time.monotonic()
+        self._scan_job = self._update_controller.submit(
+            key="scanner-scan",
             run_id=self._scan_run_id,
-            pair_exchanges=self._pair_exchanges,
-            eligible_pairs=self._eligible_pairs,
-            max_pairs=self._max_pairs_spin.value(),
-            max_intrabook_spread_pct=self._max_spread_spin.value(),
+            task=lambda: TickerScanService().scan(
+                self._pair_exchanges,
+                self._max_pairs_spin.value(),
+                pairs=self._eligible_pairs,
+                max_intrabook_spread_pct=self._max_spread_spin.value(),
+            ),
         )
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.log.connect(self._log)
-        worker.finished.connect(self._on_ticker_updated)
-        worker.failed.connect(self._on_ticker_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._ticker_worker = worker
-        self._ticker_thread = thread
-        thread.start()
+        if not self._scan_job:
+            self._scan_in_flight = False
+            return
+        self._scan_job.succeeded.connect(
+            lambda run_id, result: self._on_ticker_updated(run_id, result, scan_started)
+        )
+        self._scan_job.failed.connect(
+            lambda run_id, message: self._on_ticker_failed(run_id, message, scan_started)
+        )
 
-    def _on_ticker_updated(self, run_id: int, result: TickerScanResult) -> None:
+    def _on_ticker_updated(
+        self, run_id: int, result: TickerScanResult, scan_started: float
+    ) -> None:
         self._scan_in_flight = False
         if not self._scanning or run_id != self._scan_run_id:
             return
+        scan_latency_ms = (time.monotonic() - scan_started) * 1000
+        self._last_scan_duration_ms = scan_latency_ms
+        self._last_scan_ok = result.ok_count
+        self._last_scan_fail = result.fail_count
+        self._adjust_scan_backoff(result.fail_count)
         threshold = self._opportunity_threshold_spin.value()
         row_map = {row.pair: row for row in self._profit_rows}
         for update in result.updates:
@@ -536,16 +543,25 @@ class ScannerWindow(QMainWindow):
         self._last_scan_ts = time.monotonic()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
+        for error in result.errors:
+            self._log(error)
         self._log(
             "Update: "
             f"pairs={result.pair_count} ok={result.ok_count} "
             f"skipped={result.skipped_count} fail={result.fail_count}"
         )
 
-    def _on_ticker_failed(self, run_id: int, message: str) -> None:
+    def _on_ticker_failed(
+        self, run_id: int, message: str, scan_started: float
+    ) -> None:
         self._scan_in_flight = False
         if run_id != self._scan_run_id:
             return
+        scan_latency_ms = (time.monotonic() - scan_started) * 1000
+        self._last_scan_duration_ms = scan_latency_ms
+        self._last_scan_ok = 0
+        self._last_scan_fail += 1
+        self._adjust_scan_backoff(1)
         self._log(f"Ошибка сканирования тикеров: {message}")
 
     def _log(self, message: str) -> None:
@@ -556,9 +572,22 @@ class ScannerWindow(QMainWindow):
         eligible = len(self._eligible_pairs)
         profit_count = len(self._profit_rows)
         live_count = sum(1 for row in self._profit_rows if row.status == "LIVE")
+        latency_text = "—"
+        slow_flag = ""
+        if self._last_scan_duration_ms is not None:
+            latency_text = f"{self._last_scan_duration_ms:.0f} ms"
+            if self._last_scan_duration_ms > 5000:
+                slow_flag = " | Slow / rate-limit"
+        next_tick = "—"
+        if self._scan_timer:
+            remaining = self._scan_timer.remainingTime()
+            if remaining >= 0:
+                next_tick = f"{remaining / 1000:.1f} s"
         self._status_label.setText(
             f"Updated: {self._last_updated} | "
-            f"Eligible: {eligible} | Профитные: {profit_count} | LIVE: {live_count}"
+            f"Eligible: {eligible} | Профитные: {profit_count} | LIVE: {live_count} | "
+            f"ok={self._last_scan_ok} fail={self._last_scan_fail} | "
+            f"latency={latency_text} | next={next_tick}{slow_flag}"
         )
 
     def _start_heartbeat_timer(self) -> None:
@@ -614,91 +643,20 @@ class ScannerWindow(QMainWindow):
         self._scan_run_id += 1
         self._scan_in_flight = False
 
-
-class MarketDiscoveryWorker(QObject):
-    """Background worker for market discovery."""
-
-    finished = Signal(int, MarketDiscoveryResult)
-    failed = Signal(int, str)
-    log = Signal(str)
-    progress = Signal(int, int)
-
-    def __init__(
-        self,
-        request_id: int,
-        exchanges: list[str],
-        quotes: list[str],
-        min_exchanges: int,
-    ) -> None:
-        super().__init__()
-        self._request_id = request_id
-        self._exchanges = exchanges
-        self._quotes = quotes
-        self._min_exchanges = min_exchanges
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        try:
-            service = MarketDiscoveryService()
-            result = service.discover(
-                self._exchanges,
-                self._quotes,
-                self._min_exchanges,
-                should_cancel=self._is_cancelled,
-                progress_cb=self._emit_progress,
+    def _adjust_scan_backoff(self, fail_count: int) -> None:
+        if fail_count > 0:
+            self._scan_backoff_s = 2.0 if self._scan_backoff_s == 0 else min(
+                self._scan_backoff_s * 2, 8.0
             )
-        except Exception as exc:  # noqa: BLE001 - surface discovery errors in UI
-            self.failed.emit(self._request_id, str(exc))
-            return
-        if self._cancelled:
-            return
-        self.finished.emit(self._request_id, result)
-
-    def _is_cancelled(self) -> bool:
-        return self._cancelled
-
-    def _emit_progress(self, current: int, total: int) -> None:
-        if not self._cancelled:
-            self.progress.emit(current, total)
-
-
-class ScannerUpdateWorker(QObject):
-    """One-shot background worker for ticker scanning."""
-
-    finished = Signal(int, TickerScanResult)
-    failed = Signal(int, str)
-    log = Signal(str)
-
-    def __init__(
-        self,
-        run_id: int,
-        pair_exchanges: dict[str, list[str]],
-        eligible_pairs: list[str],
-        max_pairs: int,
-        max_intrabook_spread_pct: float,
-    ) -> None:
-        super().__init__()
-        self._run_id = run_id
-        self._pair_exchanges = pair_exchanges
-        self._eligible_pairs = eligible_pairs
-        self._max_pairs = max_pairs
-        self._max_intrabook_spread_pct = max_intrabook_spread_pct
-
-    def run(self) -> None:
-        try:
-            service = TickerScanService()
-            result = service.scan(
-                self._pair_exchanges,
-                self._max_pairs,
-                pairs=self._eligible_pairs,
-                max_intrabook_spread_pct=self._max_intrabook_spread_pct,
-            )
-        except Exception as exc:  # noqa: BLE001 - surface scan errors
-            self.failed.emit(self._run_id, str(exc))
-            return
-        for error in result.errors:
-            self.log.emit(error)
-        self.finished.emit(self._run_id, result)
+        else:
+            self._scan_backoff_s = 0.0
+        if self._scan_timer:
+            base_ms = self._scan_interval_spin.value()
+            next_ms = int(base_ms + self._scan_backoff_s * 1000)
+            self._scan_timer.setInterval(next_ms)
+            self._next_scan_eta_s = next_ms / 1000
+            if self._scan_backoff_s > 0:
+                self._log(
+                    f"Backoff активирован: {self._scan_backoff_s:.0f}s "
+                    f"(interval={next_ms} ms)"
+                )

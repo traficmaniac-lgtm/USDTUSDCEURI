@@ -5,9 +5,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from statistics import median
+import time
 from typing import Iterable
 
 import ccxt
+
+from ..core.update_controller import http_slot
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +72,10 @@ class TickerScanService:
     _default_outlier_pct = 5.0
     _exchange_map = EXCHANGE_MAP
     _timeout_ms = 10_000
+    _min_symbol_refresh_s = 4.0
+    _symbol_batch_size = 60
+    _symbol_last_fetch: dict[tuple[str, str], float] = {}
+    _exchange_offsets: dict[str, int] = {}
 
     def scan(
         self,
@@ -79,6 +86,7 @@ class TickerScanService:
         outlier_pct: float | None = None,
     ) -> TickerScanResult:
         """Fetch tickers for the given pairs and compute spreads."""
+        now = time.monotonic()
         if pairs is None:
             pairs_to_scan = sorted(pair_exchanges.keys())[:max_pairs]
         else:
@@ -114,26 +122,39 @@ class TickerScanService:
                     exchange.options["defaultType"] = "spot"
                 exchanges_cache[exchange_id] = exchange
             symbol_list = sorted(symbols)
+            due_symbols = [
+                symbol
+                for symbol in symbol_list
+                if self._is_symbol_due(exchange_label, symbol, now)
+            ]
             if exchange.has.get("fetchTickers"):
+                if not due_symbols:
+                    continue
                 try:
-                    tickers = exchange.fetch_tickers(symbol_list)
+                    with http_slot():
+                        tickers = exchange.fetch_tickers(due_symbols)
                 except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
                     fail_count += 1
                     message = f"Ticker error: {exchange_label} batch: {exc}"
                     errors.append(message)
                     logger.warning(message)
                     continue
-                for symbol in symbol_list:
+                for symbol in due_symbols:
                     ticker = tickers.get(symbol)
                     if ticker is None:
                         continue
+                    self._mark_symbol_fetched(exchange_label, symbol, now)
                     ticker_map[(symbol, exchange_label)] = ticker
                     ok_count += 1
                 continue
 
-            for symbol in symbol_list:
+            batch = self._select_symbol_batch(exchange_label, due_symbols)
+            if not batch:
+                continue
+            for symbol in batch:
                 try:
-                    ticker = exchange.fetch_ticker(symbol)
+                    with http_slot():
+                        ticker = exchange.fetch_ticker(symbol)
                     ok_count += 1
                 except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
                     fail_count += 1
@@ -141,6 +162,7 @@ class TickerScanService:
                     errors.append(message)
                     logger.warning(message)
                     continue
+                self._mark_symbol_fetched(exchange_label, symbol, now)
                 ticker_map[(symbol, exchange_label)] = ticker
 
         for pair in pairs_to_scan:
@@ -206,6 +228,7 @@ class TickerScanService:
         entries: list[PairExchangeTicker] = []
         errors: list[str] = []
         exchanges_cache: dict[str, ccxt.Exchange] = {}
+        now = time.monotonic()
         for exchange_label in exchanges:
             exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
             if not hasattr(ccxt, exchange_id):
@@ -232,7 +255,8 @@ class TickerScanService:
                     exchange.options["defaultType"] = "spot"
                 exchanges_cache[exchange_id] = exchange
             try:
-                ticker = exchange.fetch_ticker(pair)
+                with http_slot():
+                    ticker = exchange.fetch_ticker(pair)
             except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
                 message = f"Ticker error: {exchange_label} {pair}: {exc}"
                 errors.append(message)
@@ -247,6 +271,7 @@ class TickerScanService:
                     )
                 )
                 continue
+            self._mark_symbol_fetched(exchange_label, pair, now)
             bid = _as_float(ticker.get("bid"))
             ask = _as_float(ticker.get("ask"))
             volume = _pick_volume(ticker)
@@ -263,6 +288,31 @@ class TickerScanService:
                 )
             )
         return entries, errors
+
+    def _is_symbol_due(self, exchange_label: str, symbol: str, now: float) -> bool:
+        last_ts = self._symbol_last_fetch.get((exchange_label, symbol))
+        if last_ts is None:
+            return True
+        return (now - last_ts) >= self._min_symbol_refresh_s
+
+    def _mark_symbol_fetched(self, exchange_label: str, symbol: str, now: float) -> None:
+        self._symbol_last_fetch[(exchange_label, symbol)] = now
+
+    def _select_symbol_batch(self, exchange_label: str, symbols: list[str]) -> list[str]:
+        if not symbols:
+            return []
+        if len(symbols) <= self._symbol_batch_size:
+            return symbols
+        offset = self._exchange_offsets.get(exchange_label, 0)
+        batch = symbols[offset : offset + self._symbol_batch_size]
+        if not batch:
+            offset = 0
+            batch = symbols[: self._symbol_batch_size]
+        next_offset = offset + self._symbol_batch_size
+        if next_offset >= len(symbols):
+            next_offset = 0
+        self._exchange_offsets[exchange_label] = next_offset
+        return batch
 
 
 def _pick_volume(ticker: dict) -> float | None:
