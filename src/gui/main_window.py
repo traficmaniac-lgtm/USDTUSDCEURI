@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 from .models.quotes_table_model import QuotesTableModel
 from .services.ccxt_price_provider import CcxtPriceProvider
 from .services.quote_generator import FakeQuoteService
-from .services.ws_binance_provider import BinanceWsProvider
+from .services.ws_manager import WsManager
 from .widgets.exchange_selector import ExchangeSelectorDialog
 from .widgets.log_panel import LogPanel
 
@@ -100,8 +100,11 @@ class MainWindow(QMainWindow):
         self._ws_signals = WsQuoteSignals()
         self._ws_signals.updated.connect(self._handle_ws_quote)
         self._ws_signals.error.connect(self._handle_ws_error)
-        self._ws_provider: BinanceWsProvider | None = None
-        self._ws_failed = False
+        self._ws_manager = WsManager(
+            price_provider=self._price_provider,
+            on_quote=self._ws_signals.updated.emit,
+            on_error=self._ws_signals.error.emit,
+        )
         self._build_ui()
         self._setup_logging()
         self._set_status("Idle")
@@ -226,10 +229,12 @@ class MainWindow(QMainWindow):
             sorted(self._selected_exchanges),
             self._interval_spin.value(),
         )
-        self._ws_failed = False
-        if "Binance" in self._selected_exchanges:
+        if any(self._ws_manager.supports_exchange(exchange) for exchange in self._selected_exchanges):
             self._ensure_http_interval_for_ws()
-            self._start_binance_ws()
+        self._ws_manager.start_for_selected_exchanges(
+            self._pair_combo.currentText(),
+            list(self._selected_exchanges),
+        )
         self._timer.start(self._interval_spin.value())
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
@@ -239,7 +244,7 @@ class MainWindow(QMainWindow):
     def _stop_stream(self) -> None:
         if not self._timer.isActive():
             return
-        self._stop_binance_ws()
+        self._ws_manager.stop_all()
         self._timer.stop()
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
@@ -291,17 +296,12 @@ class MainWindow(QMainWindow):
     def _handle_ws_quote(self, quote: dict[str, object]) -> None:
         if not self._timer.isActive():
             return
-        if str(quote.get("exchange")) != "Binance":
-            return
         self._table_model.update_exchange_quote(quote)
         self._last_update = datetime.now().strftime("%H:%M:%S")
         self._update_counters()
 
     def _handle_ws_error(self, _message: str) -> None:
-        if self._ws_failed:
-            return
-        self._ws_failed = True
-        self._stop_binance_ws()
+        logger.warning("WS provider error: {}", _message)
 
     def _update_interval(self) -> None:
         if self._timer.isActive():
@@ -456,28 +456,6 @@ class MainWindow(QMainWindow):
     def _ensure_http_interval_for_ws(self) -> None:
         if self._interval_spin.value() < 5000:
             self._interval_spin.setValue(5000)
-
-    def _start_binance_ws(self) -> None:
-        if self._ws_provider or self._ws_failed:
-            return
-        pair = self._pair_combo.currentText()
-        symbol, error = self._price_provider.resolve_symbol("Binance", pair)
-        if not symbol:
-            logger.warning("WS disabled | {}", error or "Symbol not resolved")
-            return
-        self._ws_provider = BinanceWsProvider(
-            symbol=symbol,
-            on_quote=self._ws_signals.updated.emit,
-            on_error=self._ws_signals.error.emit,
-        )
-        self._ws_provider.start()
-
-    def _stop_binance_ws(self) -> None:
-        if not self._ws_provider:
-            return
-        self._ws_provider.stop()
-        self._ws_provider.join(timeout=1)
-        self._ws_provider = None
 
     def _open_logs_folder(self) -> None:
         QMessageBox.information(self, "Logs", "Logs folder is not configured yet.")
