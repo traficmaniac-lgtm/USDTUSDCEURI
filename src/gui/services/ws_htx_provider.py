@@ -36,6 +36,17 @@ class HtxWsProvider(WsProviderBase):
     def stream_symbol(symbol: str) -> str:
         return symbol.replace("/", "").lower()
 
+    def _handle_fatal_error(self, message: object) -> None:
+        self._emit_error(message)
+        self._emit_quote(
+            bid=0.0,
+            ask=0.0,
+            last=0.0,
+            status="HTTP_ONLY",
+            error=str(message),
+        )
+        self.stop()
+
     def run(self) -> None:
         stream_symbol = self.stream_symbol(self.resolved_symbol)
         topic = f"market.{stream_symbol}.ticker"
@@ -49,7 +60,7 @@ class HtxWsProvider(WsProviderBase):
             self._log_disconnected()
 
         def on_error(_ws: websocket.WebSocketApp, error: object) -> None:
-            self._emit_error(error)
+            self._handle_fatal_error(error)
 
         def on_message(ws: websocket.WebSocketApp, message: str | bytes) -> None:
             if self._stop_event.is_set():
@@ -67,7 +78,10 @@ class HtxWsProvider(WsProviderBase):
                 ws.send(json.dumps({"pong": payload["ping"]}))
                 return
             if payload.get("status") == "error":
-                self._emit_error(payload.get("err-msg") or payload)
+                self._handle_fatal_error(payload.get("err-msg") or payload)
+                return
+            if payload.get("err-code"):
+                self._handle_fatal_error(payload.get("err-msg") or payload)
                 return
             tick = payload.get("tick")
             if not tick:

@@ -16,7 +16,7 @@ class BitgetWsProvider(WsProviderBase):
 
     ENABLED = True
     LOG_INTERVAL = timedelta(seconds=10)
-    STREAM_URL = "wss://ws.bitget.com/spot/v1/stream"
+    STREAM_URL = "wss://ws.bitget.com/v2/ws/public"
 
     def __init__(
         self,
@@ -33,7 +33,18 @@ class BitgetWsProvider(WsProviderBase):
 
     @staticmethod
     def stream_symbol(symbol: str) -> str:
-        return symbol.replace("/", "")
+        return symbol.replace("/", "").upper()
+
+    def _handle_fatal_error(self, message: object) -> None:
+        self._emit_error(message)
+        self._emit_quote(
+            bid=0.0,
+            ask=0.0,
+            last=0.0,
+            status="HTTP_ONLY",
+            error=str(message),
+        )
+        self.stop()
 
     def run(self) -> None:
         inst_id = self.stream_symbol(self.resolved_symbol)
@@ -50,7 +61,7 @@ class BitgetWsProvider(WsProviderBase):
             self._log_disconnected()
 
         def on_error(_ws: websocket.WebSocketApp, error: object) -> None:
-            self._emit_error(error)
+            self._handle_fatal_error(error)
 
         def on_message(_ws: websocket.WebSocketApp, message: str) -> None:
             if self._stop_event.is_set():
@@ -60,7 +71,10 @@ class BitgetWsProvider(WsProviderBase):
             except json.JSONDecodeError:
                 return
             if payload.get("event") == "error":
-                self._emit_error(payload.get("message") or payload)
+                self._handle_fatal_error(payload.get("msg") or payload.get("message") or payload)
+                return
+            if payload.get("code") not in (None, 0, "0"):
+                self._handle_fatal_error(payload.get("msg") or payload.get("message") or payload)
                 return
             data = payload.get("data")
             if not data:
