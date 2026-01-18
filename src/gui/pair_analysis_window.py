@@ -45,46 +45,23 @@ class PairAnalysisSnapshot:
 class PairAnalysisWorker(QObject):
     """Worker to refresh pair analysis data without blocking UI."""
 
-    updated = Signal(PairAnalysisSnapshot)
-    scan_started = Signal()
-    stopped = Signal()
+    finished = Signal(object)
+    failed = Signal(int, str)
 
-    def __init__(self, symbol: str, exchanges: list[str], interval_ms: int) -> None:
+    def __init__(self, run_id: int, symbol: str, exchanges: list[str]) -> None:
         super().__init__()
+        self._run_id = run_id
         self._symbol = symbol
         self._exchanges = list(exchanges)
-        self._interval_ms = interval_ms
-        self._timer: QTimer | None = None
-        self._stopped = False
 
-    def start(self) -> None:
-        self._stopped = False
-        if self._timer is None:
-            self._timer = QTimer()
-            self._timer.setInterval(self._interval_ms)
-            self._timer.timeout.connect(self._run_scan)
-        self._timer.start()
-        self._run_scan()
-
-    def pause(self) -> None:
-        if self._timer:
-            self._timer.stop()
-
-    def stop(self) -> None:
-        self._stopped = True
-        if self._timer:
-            self._timer.stop()
-        self.stopped.emit()
-
-    def refresh(self) -> None:
-        self._run_scan()
-
-    def _run_scan(self) -> None:
-        if self._stopped:
-            return
-        self.scan_started.emit()
+    def run(self) -> None:
+        start_ts = time.monotonic()
         service = TickerScanService()
-        entries, errors = service.fetch_pair_tickers(self._symbol, self._exchanges)
+        try:
+            entries, errors = service.fetch_pair_tickers(self._symbol, self._exchanges)
+        except Exception as exc:  # noqa: BLE001 - surface fetch errors
+            self.failed.emit(self._run_id, str(exc))
+            return
         best_buy_exchange = None
         buy_ask = None
         best_sell_exchange = None
@@ -117,7 +94,30 @@ class PairAnalysisWorker(QObject):
             spread_pct=spread_pct,
             errors=errors,
         )
-        self.updated.emit(snapshot)
+        latency_ms = (time.monotonic() - start_ts) * 1000
+        ok_count = sum(1 for entry in entries if entry.status == "OK")
+        fail_count = len(entries) - ok_count
+        first_error = errors[0] if errors else None
+        self.finished.emit(
+            PairAnalysisUpdatePayload(
+                run_id=self._run_id,
+                snapshot=snapshot,
+                latency_ms=latency_ms,
+                ok_count=ok_count,
+                fail_count=fail_count,
+                first_error=first_error,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class PairAnalysisUpdatePayload:
+    run_id: int
+    snapshot: PairAnalysisSnapshot
+    latency_ms: float
+    ok_count: int
+    fail_count: int
+    first_error: str | None
 
 
 class PairAnalysisWindow(QMainWindow):
@@ -139,10 +139,12 @@ class PairAnalysisWindow(QMainWindow):
         self._interval_ms = interval_ms
         self._worker_thread: QThread | None = None
         self._worker: PairAnalysisWorker | None = None
+        self._update_timer: QTimer | None = None
+        self.run_id = 0
+        self.in_flight = False
         self._bad_updates_streak = 0
         self._analysis_status = "ПАУЗА"
         self._slow_update = False
-        self._refresh_started_ts: float | None = None
 
         self.setWindowTitle(f"Анализ пары: {symbol}")
         self.resize(1100, 820)
@@ -278,64 +280,70 @@ class PairAnalysisWindow(QMainWindow):
         return group
 
     def _start_worker(self) -> None:
-        if self._worker_thread and self._worker and self._worker_thread.isRunning():
-            self._worker.start()
-            self._start_button.setEnabled(False)
-            self._stop_button.setEnabled(True)
-            self._bad_updates_streak = 0
-            return
-        self._worker = PairAnalysisWorker(
-            symbol=self._symbol,
-            exchanges=self._exchanges,
-            interval_ms=self._interval_ms,
-        )
-        self._worker_thread = QThread(self)
-        self._worker.moveToThread(self._worker_thread)
-        self._worker_thread.started.connect(self._worker.start)
-        self._worker.updated.connect(self._on_snapshot)
-        self._worker.scan_started.connect(self._on_scan_started)
-        self._worker.stopped.connect(self._worker_thread.quit)
-        self._worker_thread.finished.connect(self._on_worker_finished)
-        self._worker_thread.start()
+        self.run_id += 1
+        self.in_flight = False
+        if self._update_timer is None:
+            self._update_timer = QTimer(self)
+            self._update_timer.timeout.connect(self._request_update)
+        self._update_timer.setInterval(self._interval_ms)
+        self._update_timer.start()
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
         self._bad_updates_streak = 0
+        self._request_update()
 
     def _pause_worker(self) -> None:
-        if self._worker:
-            self._worker.pause()
+        self.run_id += 1
+        self.in_flight = False
+        if self._update_timer:
+            self._update_timer.stop()
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._set_analysis_status("ПАУЗА")
 
     def _stop_worker(self) -> None:
-        if self._worker:
-            self._worker.stop()
-        self._start_button.setEnabled(True)
-        self._stop_button.setEnabled(False)
-
-    def _on_worker_finished(self) -> None:
-        if self._worker:
-            self._worker.deleteLater()
-        if self._worker_thread:
-            self._worker_thread.deleteLater()
-        self._worker = None
-        self._worker_thread = None
+        self._pause_worker()
 
     def _refresh_worker(self) -> None:
-        if self._worker:
-            self._worker.refresh()
-        else:
-            self._start_worker()
-            if self._worker:
-                self._worker.pause()
+        self._request_update()
 
-    def _on_snapshot(self, snapshot: PairAnalysisSnapshot) -> None:
-        self._finalize_refresh()
+    def _request_update(self) -> None:
+        if self.in_flight:
+            return
+        self.in_flight = True
+        run_id = self.run_id
+        self._refresh_progress.setVisible(True)
+        worker = PairAnalysisWorker(run_id, self._symbol, self._exchanges)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_snapshot)
+        worker.failed.connect(self._on_worker_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._cleanup_worker)
+        self._worker = worker
+        self._worker_thread = thread
+        thread.start()
+
+    def _on_snapshot(self, payload: PairAnalysisUpdatePayload) -> None:
+        if payload.run_id != self.run_id:
+            return
+        self.in_flight = False
+        self._finalize_refresh(payload.latency_ms)
+        self._append_update_log(
+            payload.ok_count,
+            payload.fail_count,
+            payload.latency_ms,
+            payload.first_error,
+        )
+        snapshot = payload.snapshot
         if not self._has_valid_data(snapshot):
             self._bad_updates_streak += 1
             self._set_analysis_status("ОШИБКА")
-            self._append_error_history()
+            self._append_error_history(payload.first_error)
             if self._bad_updates_streak >= 5:
                 self._auto_pause_for_bad_data()
             return
@@ -347,15 +355,7 @@ class PairAnalysisWindow(QMainWindow):
         self._update_status_from_spread(snapshot.spread_pct)
         self._append_history(snapshot)
 
-    def _on_scan_started(self) -> None:
-        self._refresh_started_ts = time.monotonic()
-        self._refresh_progress.setVisible(True)
-
-    def _finalize_refresh(self) -> None:
-        now = time.monotonic()
-        latency_ms = None
-        if self._refresh_started_ts is not None:
-            latency_ms = (now - self._refresh_started_ts) * 1000
+    def _finalize_refresh(self, latency_ms: float | None) -> None:
         self._refresh_progress.setVisible(False)
         self._last_update_label.setText(datetime.now().strftime("%H:%M:%S"))
         if latency_ms is None:
@@ -364,6 +364,20 @@ class PairAnalysisWindow(QMainWindow):
         else:
             self._latency_label.setText(f"{latency_ms:.0f} ms")
             self._slow_update = latency_ms > 4000
+        self._set_analysis_status(self._analysis_status)
+
+    def _on_worker_failed(self, run_id: int, message: str) -> None:
+        if run_id != self.run_id:
+            return
+        self.in_flight = False
+        self._finalize_refresh(None)
+        self._set_analysis_status("ОШИБКА")
+        self._append_update_log(0, len(self._exchanges), 0, message)
+        self._append_error_history(message)
+
+    def _cleanup_worker(self) -> None:
+        self._worker = None
+        self._worker_thread = None
 
     def _update_table(
         self,
@@ -518,9 +532,29 @@ class PairAnalysisWindow(QMainWindow):
             return False
         return True
 
-    def _append_error_history(self) -> None:
+    def _append_update_log(
+        self,
+        ok_count: int,
+        fail_count: int,
+        latency_ms: float,
+        first_error: str | None,
+    ) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self._add_history_line(f"{timestamp} | ОШИБКА: недостаточно данных")
+        line = (
+            f"{timestamp} | ok={ok_count} fail={fail_count} | "
+            f"latency={latency_ms:.0f}ms"
+        )
+        if first_error:
+            line = f"{line} | reason={first_error}"
+        self._add_history_line(line)
+
+    def _append_error_history(self, reason: str | None = None) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if reason:
+            line = f"{timestamp} | ОШИБКА: {reason}"
+        else:
+            line = f"{timestamp} | ОШИБКА: недостаточно данных"
+        self._add_history_line(line)
 
     def _auto_pause_for_bad_data(self) -> None:
         self._pause_worker()
