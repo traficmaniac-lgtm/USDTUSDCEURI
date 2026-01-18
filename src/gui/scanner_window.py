@@ -15,9 +15,11 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -46,11 +48,12 @@ class ScannerWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Scanner Mode")
+        self.setWindowTitle("Сканер рынка")
         self.resize(1200, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         self._rows: list[ScannerRow] = []
+        self._profit_rows: list[ScannerRow] = []
         self._scanning = False
         self._last_updated = "—"
         self._discovery_thread: QThread | None = None
@@ -61,7 +64,7 @@ class ScannerWindow(QMainWindow):
         self._pair_exchanges: dict[str, list[str]] = {}
 
         self._build_ui()
-        self._log("Scanner window opened")
+        self._log("Окно сканера открыто")
         self._update_status()
 
     def _build_ui(self) -> None:
@@ -69,24 +72,25 @@ class ScannerWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.addWidget(self._build_settings_panel())
         layout.addLayout(self._build_controls())
-        layout.addWidget(self._build_table())
+        layout.addLayout(self._build_transfer_controls())
+        layout.addWidget(self._build_tables_splitter())
         layout.addLayout(self._build_status_log())
         self.setCentralWidget(central)
         self._create_actions()
 
     def _create_actions(self) -> None:
-        close_action = QAction("Close", self)
+        close_action = QAction("Закрыть", self)
         close_action.triggered.connect(self.close)
         self.addAction(close_action)
 
     def _build_settings_panel(self) -> QGroupBox:
-        group = QGroupBox("Settings")
+        group = QGroupBox("Настройки")
         outer_layout = QVBoxLayout(group)
 
         grid_layout = QVBoxLayout()
 
         quote_layout = QHBoxLayout()
-        quote_layout.addWidget(QLabel("Quote currencies:"))
+        quote_layout.addWidget(QLabel("Котируемые валюты:"))
         self._quote_usdt = QCheckBox("USDT")
         self._quote_usdc = QCheckBox("USDC")
         self._quote_usdt.setChecked(True)
@@ -97,33 +101,33 @@ class ScannerWindow(QMainWindow):
         grid_layout.addLayout(quote_layout)
 
         self._min_exchanges_spin = self._make_spinbox(1, 50, 5)
-        grid_layout.addLayout(self._labeled_row("Min exchanges per pair:", self._min_exchanges_spin))
+        grid_layout.addLayout(self._labeled_row("Мин. бирж на пару:", self._min_exchanges_spin))
 
         self._min_volume_spin = self._make_double_spinbox(0, 10_000_000, 200_000, decimals=0)
-        grid_layout.addLayout(self._labeled_row("Min 24h volume ($):", self._min_volume_spin))
+        grid_layout.addLayout(self._labeled_row("Мин. 24ч объём ($):", self._min_volume_spin))
 
         self._max_spread_spin = self._make_double_spinbox(0.0, 100.0, 1.0, decimals=2)
-        grid_layout.addLayout(self._labeled_row("Max intrabook spread %:", self._max_spread_spin))
+        grid_layout.addLayout(self._labeled_row("Макс. спред %:", self._max_spread_spin))
 
         self._opportunity_threshold_spin = self._make_double_spinbox(0.0, 100.0, 0.15, decimals=2)
-        grid_layout.addLayout(self._labeled_row("Opportunity threshold %:", self._opportunity_threshold_spin))
+        grid_layout.addLayout(self._labeled_row("Порог возможности %:", self._opportunity_threshold_spin))
 
         self._persistence_spin = self._make_spinbox(1, 10, 3)
-        grid_layout.addLayout(self._labeled_row("Persistence K:", self._persistence_spin))
+        grid_layout.addLayout(self._labeled_row("Устойчивость K:", self._persistence_spin))
 
         self._max_pairs_spin = self._make_spinbox(10, 10_000, 300)
-        grid_layout.addLayout(self._labeled_row("Max pairs to scan:", self._max_pairs_spin))
+        grid_layout.addLayout(self._labeled_row("Макс. пар для скана:", self._max_pairs_spin))
 
         self._scan_interval_spin = self._make_spinbox(250, 10_000, 2000)
-        self._scan_interval_spin.setSuffix(" ms")
-        grid_layout.addLayout(self._labeled_row("Scan interval (ms):", self._scan_interval_spin))
+        self._scan_interval_spin.setSuffix(" мс")
+        grid_layout.addLayout(self._labeled_row("Интервал скана (мс):", self._scan_interval_spin))
 
         outer_layout.addLayout(grid_layout)
         outer_layout.addWidget(self._build_exchanges_group())
         return group
 
     def _build_exchanges_group(self) -> QGroupBox:
-        group = QGroupBox("Exchanges")
+        group = QGroupBox("Биржи")
         layout = QVBoxLayout(group)
         self._exchanges_list = QListWidget()
         for name in self._exchange_names:
@@ -136,26 +140,50 @@ class ScannerWindow(QMainWindow):
 
     def _build_controls(self) -> QHBoxLayout:
         layout = QHBoxLayout()
-        self._start_button = QPushButton("Start Scan")
-        self._stop_button = QPushButton("Stop")
-        self._clear_button = QPushButton("Clear")
-        self._watchlist_button = QPushButton("Add to Watchlist")
+        self._start_button = QPushButton("Старт")
+        self._stop_button = QPushButton("Стоп")
+        self._clear_button = QPushButton("Очистить")
 
         self._start_button.clicked.connect(self._start_scan)
         self._stop_button.clicked.connect(self._stop_scan)
         self._clear_button.clicked.connect(self._clear_scan)
-        self._watchlist_button.clicked.connect(self._add_to_watchlist)
 
         self._stop_button.setEnabled(False)
 
         layout.addWidget(self._start_button)
         layout.addWidget(self._stop_button)
         layout.addWidget(self._clear_button)
-        layout.addWidget(self._watchlist_button)
         layout.addStretch()
         return layout
 
-    def _build_table(self) -> QTableView:
+    def _build_transfer_controls(self) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        self._add_profit_button = QPushButton("Добавить →")
+        self._remove_profit_button = QPushButton("← Убрать")
+        self._open_analysis_button = QPushButton("Открыть анализ")
+
+        self._add_profit_button.clicked.connect(self._add_to_profit)
+        self._remove_profit_button.clicked.connect(self._remove_from_profit)
+        self._open_analysis_button.clicked.connect(self._open_analysis)
+
+        layout.addStretch()
+        layout.addWidget(self._add_profit_button)
+        layout.addWidget(self._remove_profit_button)
+        layout.addWidget(self._open_analysis_button)
+        layout.addStretch()
+        return layout
+
+    def _build_tables_splitter(self) -> QSplitter:
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_candidates_panel())
+        splitter.addWidget(self._build_profit_panel())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        return splitter
+
+    def _build_candidates_panel(self) -> QGroupBox:
+        group = QGroupBox("Все пары")
+        layout = QVBoxLayout(group)
         self._table_model = ScannerTableModel()
         self._table_view = QTableView()
         self._proxy_model = self._create_proxy_model(self._table_model)
@@ -166,7 +194,25 @@ class ScannerWindow(QMainWindow):
         self._table_view.horizontalHeader().setDefaultSectionSize(130)
         self._table_view.setSelectionBehavior(QTableView.SelectRows)
         self._table_view.setSelectionMode(QTableView.ExtendedSelection)
-        return self._table_view
+        layout.addWidget(self._table_view)
+        return group
+
+    def _build_profit_panel(self) -> QGroupBox:
+        group = QGroupBox("Профитные")
+        layout = QVBoxLayout(group)
+        self._profit_table_model = ScannerTableModel()
+        self._profit_table_view = QTableView()
+        self._profit_proxy_model = self._create_proxy_model(self._profit_table_model)
+        self._profit_table_view.setModel(self._profit_proxy_model)
+        self._profit_table_view.setSortingEnabled(True)
+        self._profit_table_view.setAlternatingRowColors(True)
+        self._profit_table_view.horizontalHeader().setStretchLastSection(True)
+        self._profit_table_view.horizontalHeader().setDefaultSectionSize(130)
+        self._profit_table_view.setSelectionBehavior(QTableView.SelectRows)
+        self._profit_table_view.setSelectionMode(QTableView.ExtendedSelection)
+        self._profit_table_view.doubleClicked.connect(self._open_analysis)
+        layout.addWidget(self._profit_table_view)
+        return group
 
     def _build_status_log(self) -> QVBoxLayout:
         layout = QVBoxLayout()
@@ -239,11 +285,13 @@ class ScannerWindow(QMainWindow):
         self._rows = []
         self._pair_exchanges = {}
         self._table_model.set_rows([])
+        self._profit_rows = []
+        self._profit_table_model.set_rows([])
         self._scanning = True
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
-        self._log("Start Scan clicked")
-        self._log(f"Loading markets for {len(selected_exchanges)} exchanges...")
+        self._log("Сканирование запущено")
+        self._log(f"Загружаем рынки: биржи={len(selected_exchanges)}")
         self._update_status()
         self._start_market_discovery(selected_exchanges, quotes, min_exchanges)
 
@@ -255,7 +303,7 @@ class ScannerWindow(QMainWindow):
         self._scanning = False
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
-        self._log("Stop clicked")
+        self._log("Сканирование остановлено")
         self._update_status()
 
     def _clear_scan(self) -> None:
@@ -264,24 +312,72 @@ class ScannerWindow(QMainWindow):
         self._rows = []
         self._pair_exchanges = {}
         self._table_model.set_rows([])
+        self._profit_rows = []
+        self._profit_table_model.set_rows([])
         self._scanning = False
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._last_updated = "—"
-        self._log("Clear clicked")
+        self._log("Данные очищены")
         self._update_status()
 
-    def _add_to_watchlist(self) -> None:
+    def _add_to_profit(self) -> None:
         selection = self._table_view.selectionModel()
         rows = selection.selectedRows() if selection else []
-        pairs: list[str] = []
+        if not rows:
+            return
+        existing_pairs = {row.pair for row in self._profit_rows}
+        added_rows: list[ScannerRow] = []
         for proxy_index in rows:
             source_index = self._proxy_model.mapToSource(proxy_index)
             if 0 <= source_index.row() < len(self._rows):
-                pairs.append(self._rows[source_index.row()].pair)
-        self._log(f"Add to Watchlist clicked: {len(rows)} rows")
-        if pairs:
-            self._log(f"Selected pairs: {', '.join(pairs)}")
+                row = self._rows[source_index.row()]
+                if row.pair not in existing_pairs:
+                    existing_pairs.add(row.pair)
+                    added_rows.append(row)
+        if not added_rows:
+            self._log("Профитные пары уже содержат выбранные элементы")
+            return
+        self._profit_rows.extend(added_rows)
+        self._profit_table_model.set_rows(self._profit_rows)
+        self._log(f"Добавлено в профитные: {len(added_rows)}")
+        self._update_status()
+
+    def _remove_from_profit(self) -> None:
+        selection = self._profit_table_view.selectionModel()
+        rows = selection.selectedRows() if selection else []
+        if not rows:
+            return
+        selected_pairs = set()
+        for proxy_index in rows:
+            source_index = self._profit_proxy_model.mapToSource(proxy_index)
+            if 0 <= source_index.row() < len(self._profit_rows):
+                selected_pairs.add(self._profit_rows[source_index.row()].pair)
+        if not selected_pairs:
+            return
+        before_count = len(self._profit_rows)
+        self._profit_rows = [row for row in self._profit_rows if row.pair not in selected_pairs]
+        self._profit_table_model.set_rows(self._profit_rows)
+        removed_count = before_count - len(self._profit_rows)
+        self._log(f"Удалено из профитных: {removed_count}")
+        self._update_status()
+
+    def _open_analysis(self, _index=None) -> None:
+        selection = self._profit_table_view.selectionModel()
+        rows = selection.selectedRows() if selection else []
+        if not rows:
+            return
+        proxy_index = rows[0]
+        source_index = self._profit_proxy_model.mapToSource(proxy_index)
+        if not (0 <= source_index.row() < len(self._profit_rows)):
+            return
+        pair = self._profit_rows[source_index.row()].pair
+        self._log(f"Запрос на открытие анализа: {pair}")
+        QMessageBox.information(
+            self,
+            "Анализ пары",
+            "Окно анализа будет добавлено на этапе 6.2.4",
+        )
 
     def _start_market_discovery(
         self,
@@ -318,9 +414,11 @@ class ScannerWindow(QMainWindow):
         if request_id != self._discovery_request_id:
             return
         for exchange, count in result.exchange_counts.items():
-            self._log(f"Markets loaded: {exchange}={count}")
+            self._log(f"Рынки загружены: {exchange}={count}")
         min_exchanges = self._min_exchanges_spin.value()
-        self._log(f"Eligible pairs: {len(result.eligible_pairs)} (min exchanges={min_exchanges})")
+        self._log(
+            f"Кандидаты: {len(result.eligible_pairs)} (мин. бирж={min_exchanges})"
+        )
         self._pair_exchanges = result.pair_exchanges
         self._rows = [
             ScannerRow(
@@ -339,6 +437,8 @@ class ScannerWindow(QMainWindow):
             for pair in result.eligible_pairs
         ]
         self._table_model.set_rows(self._rows)
+        self._profit_rows = []
+        self._profit_table_model.set_rows([])
         if self._scanning:
             self._start_ticker_scan()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
@@ -347,7 +447,7 @@ class ScannerWindow(QMainWindow):
     def _on_discovery_failed(self, request_id: int, message: str) -> None:
         if request_id != self._discovery_request_id:
             return
-        self._log(f"Market discovery error: {message}")
+        self._log(f"Ошибка поиска рынков: {message}")
         self._stop_ticker_scan()
         self._scanning = False
         self._start_button.setEnabled(True)
@@ -372,7 +472,7 @@ class ScannerWindow(QMainWindow):
         self._ticker_thread.finished.connect(self._ticker_worker.deleteLater)
         self._ticker_thread.finished.connect(self._ticker_thread.deleteLater)
         self._ticker_thread.start()
-        self._log("Ticker scan started")
+        self._log("Сканирование тикеров запущено")
 
     def _stop_ticker_scan(self) -> None:
         if self._ticker_worker:
@@ -397,10 +497,12 @@ class ScannerWindow(QMainWindow):
             row.volume_24h = update.volume_24h
             row.status = "—"
         self._table_model.notify_rows_updated()
+        self._profit_table_model.notify_rows_updated()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
         self._log(
-            f"Ticker update: pairs={result.pair_count} ok={result.ok_count} fail={result.fail_count}"
+            "Обновление тикеров: "
+            f"пар={result.pair_count} ok={result.ok_count} fail={result.fail_count}"
         )
 
     def _log(self, message: str) -> None:
@@ -408,10 +510,13 @@ class ScannerWindow(QMainWindow):
         self._log_view.appendPlainText(f"[{timestamp}] {message}")
 
     def _update_status(self) -> None:
-        scanning_state = "ON" if self._scanning else "OFF"
+        scanning_state = "ВКЛ" if self._scanning else "ВЫКЛ"
         candidates = len(self._rows)
+        profit_count = len(self._profit_rows)
         self._status_label.setText(
-            f"Scanning: {scanning_state} | Candidates: {candidates} | Updated: {self._last_updated}"
+            "Сканирование: "
+            f"{scanning_state} | Кандидаты: {candidates} | "
+            f"Профитные: {profit_count} | Обновлено: {self._last_updated}"
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -507,7 +612,7 @@ class TickerScanWorker(QObject):
             service = TickerScanService()
             result = service.scan(self._pair_exchanges, self._max_pairs)
         except Exception as exc:  # noqa: BLE001 - surface scan errors
-            self.log.emit(f"Ticker scan error: {exc}")
+            self.log.emit(f"Ошибка сканирования тикеров: {exc}")
             return
         for error in result.errors:
             self.log.emit(error)
