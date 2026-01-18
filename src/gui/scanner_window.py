@@ -69,6 +69,11 @@ class ScannerWindow(QMainWindow):
         self._last_scan_ts: float | None = None
         self._heartbeat_timer: QTimer | None = None
         self._discovery_total_exchanges = 0
+        self._scan_timer: QTimer | None = None
+        self._scan_run_id = 0
+        self._scan_in_flight = False
+        self._stage = "STOP"
+        self._heartbeat_phase = 0
 
         self._build_ui()
         self._start_heartbeat_timer()
@@ -281,6 +286,7 @@ class ScannerWindow(QMainWindow):
     def _start_scan(self) -> None:
         if self._scanning:
             return
+        self._bump_scan_run()
         selected_exchanges = self._selected_exchanges()
         quotes = self._selected_quote_currencies()
         min_exchanges = self._min_exchanges_spin.value()
@@ -303,6 +309,7 @@ class ScannerWindow(QMainWindow):
     def _stop_scan(self) -> None:
         if not self._scanning:
             return
+        self._bump_scan_run()
         self._cancel_market_discovery()
         self._stop_ticker_scan()
         self._scanning = False
@@ -314,6 +321,7 @@ class ScannerWindow(QMainWindow):
         self._update_status()
 
     def _clear_scan(self) -> None:
+        self._bump_scan_run()
         self._cancel_market_discovery()
         self._stop_ticker_scan()
         self._eligible_pairs = []
@@ -434,22 +442,12 @@ class ScannerWindow(QMainWindow):
         interval_ms = self._scan_interval_spin.value()
         max_pairs = self._max_pairs_spin.value()
         max_intrabook_spread_pct = self._max_spread_spin.value()
-        self._ticker_worker = TickerScanWorker(
-            pair_exchanges=self._pair_exchanges,
-            eligible_pairs=self._eligible_pairs,
-            max_pairs=max_pairs,
-            interval_ms=interval_ms,
-            max_intrabook_spread_pct=max_intrabook_spread_pct,
-        )
-        self._ticker_thread = QThread(self)
-        self._ticker_worker.moveToThread(self._ticker_thread)
-        self._ticker_thread.started.connect(self._ticker_worker.start)
-        self._ticker_worker.log.connect(self._log)
-        self._ticker_worker.updated.connect(self._on_ticker_updated)
-        self._ticker_worker.stopped.connect(self._ticker_thread.quit)
-        self._ticker_thread.finished.connect(self._ticker_worker.deleteLater)
-        self._ticker_thread.finished.connect(self._ticker_thread.deleteLater)
-        self._ticker_thread.start()
+        if self._scan_timer is None:
+            self._scan_timer = QTimer(self)
+            self._scan_timer.timeout.connect(self._trigger_ticker_scan)
+        self._scan_timer.setInterval(interval_ms)
+        self._scan_timer.start()
+        self._trigger_ticker_scan()
         pairs_count = min(max_pairs, len(self._eligible_pairs))
         self._log(
             "Скан цен запущен: "
@@ -457,13 +455,40 @@ class ScannerWindow(QMainWindow):
         )
 
     def _stop_ticker_scan(self) -> None:
-        if self._ticker_worker:
-            self._ticker_worker.stop()
-        self._ticker_thread = None
         self._ticker_worker = None
+        self._ticker_thread = None
+        self._scan_in_flight = False
+        if self._scan_timer:
+            self._scan_timer.stop()
 
-    def _on_ticker_updated(self, result: TickerScanResult) -> None:
-        if not self._scanning:
+    def _trigger_ticker_scan(self) -> None:
+        if not self._scanning or self._scan_in_flight:
+            return
+        self._scan_in_flight = True
+        worker = ScannerUpdateWorker(
+            run_id=self._scan_run_id,
+            pair_exchanges=self._pair_exchanges,
+            eligible_pairs=self._eligible_pairs,
+            max_pairs=self._max_pairs_spin.value(),
+            max_intrabook_spread_pct=self._max_spread_spin.value(),
+        )
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.log.connect(self._log)
+        worker.finished.connect(self._on_ticker_updated)
+        worker.failed.connect(self._on_ticker_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._ticker_worker = worker
+        self._ticker_thread = thread
+        thread.start()
+
+    def _on_ticker_updated(self, run_id: int, result: TickerScanResult) -> None:
+        self._scan_in_flight = False
+        if not self._scanning or run_id != self._scan_run_id:
             return
         threshold = self._opportunity_threshold_spin.value()
         row_map = {row.pair: row for row in self._profit_rows}
@@ -517,20 +542,23 @@ class ScannerWindow(QMainWindow):
             f"skipped={result.skipped_count} fail={result.fail_count}"
         )
 
+    def _on_ticker_failed(self, run_id: int, message: str) -> None:
+        self._scan_in_flight = False
+        if run_id != self._scan_run_id:
+            return
+        self._log(f"Ошибка сканирования тикеров: {message}")
+
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self._log_view.appendPlainText(f"[{timestamp}] {message}")
 
     def _update_status(self) -> None:
-        scanning_state = "ВКЛ" if self._scanning else "ВЫКЛ"
         eligible = len(self._eligible_pairs)
         profit_count = len(self._profit_rows)
         live_count = sum(1 for row in self._profit_rows if row.status == "LIVE")
         self._status_label.setText(
-            "Сканирование: "
-            f"{scanning_state} | Eligible: {eligible} | "
-            f"Профитные: {profit_count} | LIVE: {live_count} | "
-            f"Обновлено: {self._last_updated}"
+            f"Updated: {self._last_updated} | "
+            f"Eligible: {eligible} | Профитные: {profit_count} | LIVE: {live_count}"
         )
 
     def _start_heartbeat_timer(self) -> None:
@@ -541,29 +569,39 @@ class ScannerWindow(QMainWindow):
         self._update_heartbeat()
 
     def _update_heartbeat(self) -> None:
-        if self._last_scan_ts is None:
-            self._heartbeat_label.setText("Последний ответ: —")
+        if not self._scanning or self._last_scan_ts is None:
+            self._heartbeat_label.setText("Heartbeat: —")
             return
         elapsed = time.monotonic() - self._last_scan_ts
-        self._heartbeat_label.setText(f"Последний ответ: {elapsed:.1f}с назад")
+        interval = self._scan_interval_spin.value() / 1000
+        if elapsed > max(interval * 2, 2.5):
+            self._heartbeat_label.setText("Heartbeat: …")
+            return
+        self._heartbeat_phase = (self._heartbeat_phase + 1) % 3
+        dots = "●" * (self._heartbeat_phase + 1)
+        self._heartbeat_label.setText(f"Heartbeat: {dots}")
 
     def _set_stage_discovery(self, current: int, total: int) -> None:
+        self._stage = "DISCOVERY"
         total_text = total if total > 0 else "—"
-        self._stage_label.setText(f"Этап: Загрузка рынков ({current}/{total_text})")
+        self._stage_label.setText(f"Stage: DISCOVERY ({current}/{total_text})")
         self._progress_bar.setVisible(True)
 
     def _set_stage_scanning(self) -> None:
-        self._stage_label.setText("Этап: Сканирование тикеров")
+        self._stage = "SCAN"
+        self._stage_label.setText("Stage: SCAN")
         self._progress_bar.setVisible(True)
 
     def _set_stage_stopped(self) -> None:
-        self._stage_label.setText("Этап: Остановлено")
+        self._stage = "STOP"
+        self._stage_label.setText("Stage: STOP")
         self._progress_bar.setVisible(False)
 
     def _on_discovery_progress(self, current: int, total: int) -> None:
         self._set_stage_discovery(current, total)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._bump_scan_run()
         self._cancel_market_discovery()
         self._stop_ticker_scan()
         self._scanning = False
@@ -571,6 +609,10 @@ class ScannerWindow(QMainWindow):
         self._set_stage_stopped()
         self._update_status()
         super().closeEvent(event)
+
+    def _bump_scan_run(self) -> None:
+        self._scan_run_id += 1
+        self._scan_in_flight = False
 
 
 class MarketDiscoveryWorker(QObject):
@@ -623,47 +665,29 @@ class MarketDiscoveryWorker(QObject):
             self.progress.emit(current, total)
 
 
-class TickerScanWorker(QObject):
-    """Background worker for ticker scanning."""
+class ScannerUpdateWorker(QObject):
+    """One-shot background worker for ticker scanning."""
 
-    updated = Signal(TickerScanResult)
+    finished = Signal(int, TickerScanResult)
+    failed = Signal(int, str)
     log = Signal(str)
-    stopped = Signal()
 
     def __init__(
         self,
+        run_id: int,
         pair_exchanges: dict[str, list[str]],
         eligible_pairs: list[str],
         max_pairs: int,
-        interval_ms: int,
         max_intrabook_spread_pct: float,
     ) -> None:
         super().__init__()
+        self._run_id = run_id
         self._pair_exchanges = pair_exchanges
         self._eligible_pairs = eligible_pairs
         self._max_pairs = max_pairs
-        self._interval_ms = interval_ms
         self._max_intrabook_spread_pct = max_intrabook_spread_pct
-        self._timer: QTimer | None = None
-        self._stopped = False
 
-    def start(self) -> None:
-        if self._timer is None:
-            self._timer = QTimer()
-            self._timer.setInterval(self._interval_ms)
-            self._timer.timeout.connect(self._run_scan)
-        self._timer.start()
-        self._run_scan()
-
-    def stop(self) -> None:
-        self._stopped = True
-        if self._timer:
-            self._timer.stop()
-        self.stopped.emit()
-
-    def _run_scan(self) -> None:
-        if self._stopped:
-            return
+    def run(self) -> None:
         try:
             service = TickerScanService()
             result = service.scan(
@@ -673,8 +697,8 @@ class TickerScanWorker(QObject):
                 max_intrabook_spread_pct=self._max_intrabook_spread_pct,
             )
         except Exception as exc:  # noqa: BLE001 - surface scan errors
-            self.log.emit(f"Ошибка сканирования тикеров: {exc}")
+            self.failed.emit(self._run_id, str(exc))
             return
         for error in result.errors:
             self.log.emit(error)
-        self.updated.emit(result)
+        self.finished.emit(self._run_id, result)
