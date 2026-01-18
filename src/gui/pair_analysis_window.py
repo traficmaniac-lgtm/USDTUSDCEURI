@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import time
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from .services.ccxt_price_provider import CcxtPriceProvider
 from .services.ws_manager import WsManager
+from ..core.update_controller import get_update_controller
 from ..scanner.ticker_scan import PairExchangeTicker, TickerScanService
 
 
@@ -53,31 +54,6 @@ class WsQuoteUpdate:
     timestamp: str
     status: str
     latency_ms: float | None
-
-
-class PairAnalysisHttpWorker(QObject):
-    """One-shot HTTP fallback worker for pair analysis."""
-
-    finished = Signal(int, PairAnalysisSnapshot)
-    failed = Signal(int, str)
-    started = Signal(int)
-
-    def __init__(self, run_id: int, symbol: str, exchanges: list[str]) -> None:
-        super().__init__()
-        self._run_id = run_id
-        self._symbol = symbol
-        self._exchanges = list(exchanges)
-
-    def run(self) -> None:
-        self.started.emit(self._run_id)
-        try:
-            service = TickerScanService()
-            entries, errors = service.fetch_pair_tickers(self._symbol, self._exchanges)
-            snapshot = _build_snapshot(entries, errors)
-        except Exception as exc:  # noqa: BLE001 - surface HTTP fallback errors
-            self.failed.emit(self._run_id, str(exc))
-            return
-        self.finished.emit(self._run_id, snapshot)
 
 
 class PairAnalysisWsWorker(QObject):
@@ -151,8 +127,7 @@ class PairAnalysisWindow(QMainWindow):
         self._refresh_started_ts: float | None = None
         self._run_id = 0
         self._in_flight = False
-        self._http_thread: QThread | None = None
-        self._http_worker: PairAnalysisHttpWorker | None = None
+        self._http_job = None
         self._ws_worker: PairAnalysisWsWorker | None = None
         self._ws_last_update_ts: float | None = None
         self._ws_started_ts: float | None = None
@@ -160,8 +135,10 @@ class PairAnalysisWindow(QMainWindow):
         self._fallback_timer: QTimer | None = None
         self._heartbeat_timer: QTimer | None = None
         self._ws_stale_ms = 3000
-        self._slow_threshold_ms = 4000
+        self._slow_threshold_ms = 5000
         self._fallback_active = False
+        self._last_summary_key: tuple[float | None, float | None] | None = None
+        self._update_controller = get_update_controller()
 
         self.setWindowTitle(f"Анализ пары: {symbol}")
         self.resize(1100, 820)
@@ -319,6 +296,7 @@ class PairAnalysisWindow(QMainWindow):
         self._ws_last_update_ts = None
         self._ws_started_ts = time.monotonic()
         self._fallback_active = False
+        self._last_summary_key = None
         self._ws_worker.start(self._run_id)
         self._start_fallback_timer()
         self._start_heartbeat_timer()
@@ -336,6 +314,7 @@ class PairAnalysisWindow(QMainWindow):
         self._fallback_active = False
         self._latency_label.setText("—")
         self._slow_update = False
+        self._last_summary_key = None
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._set_analysis_status("PAUSE")
@@ -349,6 +328,7 @@ class PairAnalysisWindow(QMainWindow):
         self._fallback_active = False
         self._latency_label.setText("—")
         self._slow_update = False
+        self._last_summary_key = None
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
 
@@ -375,12 +355,6 @@ class PairAnalysisWindow(QMainWindow):
         self._add_history_line(
             f"{datetime.now().strftime('%H:%M:%S')} | ERROR: {message}"
         )
-
-    def _on_http_started(self, run_id: int) -> None:
-        if run_id != self._run_id:
-            return
-        self._refresh_started_ts = time.monotonic()
-        self._refresh_progress.setVisible(True)
 
     def _on_ws_quote(self, run_id: int, update: WsQuoteUpdate) -> None:
         if run_id != self._run_id:
@@ -441,8 +415,11 @@ class PairAnalysisWindow(QMainWindow):
         self._update_table(
             snapshot.entries, snapshot.best_buy_exchange, snapshot.best_sell_exchange
         )
-        self._update_summary(snapshot)
-        self._append_history(snapshot)
+        summary_key = (snapshot.buy_ask, snapshot.sell_bid)
+        if summary_key != self._last_summary_key:
+            self._update_summary(snapshot)
+            self._append_history(snapshot)
+            self._last_summary_key = summary_key
         if snapshot.spread_pct is not None and snapshot.spread_pct >= self._opportunity_threshold:
             status = "LIVE"
         else:
@@ -522,30 +499,30 @@ class PairAnalysisWindow(QMainWindow):
     def _start_http_fallback(self, reason: str) -> None:
         if self._in_flight:
             return
+        if self._ws_last_update_ts is not None:
+            delay_ms = (time.monotonic() - self._ws_last_update_ts) * 1000
+            if delay_ms < self._ws_stale_ms:
+                return
         self._in_flight = True
         self._fallback_active = True
-        worker = PairAnalysisHttpWorker(self._run_id, self._symbol, self._exchanges)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.started.connect(self._on_http_started)
-        worker.finished.connect(self._on_http_snapshot)
-        worker.failed.connect(self._on_http_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_http_thread_finished)
-        self._http_worker = worker
-        self._http_thread = thread
-        thread.start()
+        self._refresh_started_ts = time.monotonic()
+        self._refresh_progress.setVisible(True)
+        self._http_job = self._update_controller.submit(
+            key=f"pair-http-{self._symbol}",
+            run_id=self._run_id,
+            task=lambda: _build_snapshot(
+                *TickerScanService().fetch_pair_tickers(self._symbol, self._exchanges)
+            ),
+        )
+        if not self._http_job:
+            self._in_flight = False
+            self._refresh_progress.setVisible(False)
+            return
+        self._http_job.succeeded.connect(self._on_http_snapshot)
+        self._http_job.failed.connect(self._on_http_failed)
         self._add_history_line(
             f"{datetime.now().strftime('%H:%M:%S')} | HTTP fallback ({reason})"
         )
-
-    def _on_http_thread_finished(self) -> None:
-        self._http_worker = None
-        self._http_thread = None
 
     def _check_ws_staleness(self) -> None:
         if self._start_button.isEnabled():
