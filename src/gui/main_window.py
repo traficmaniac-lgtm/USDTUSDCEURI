@@ -79,6 +79,9 @@ class MainWindow(QMainWindow):
         self._updates_count = 0
         self._errors_count = 0
         self._last_update = "—"
+        self._last_requested_exchanges: list[str] = []
+        self._last_requested_pair = ""
+        self._log_single_fetch = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_quotes)
         self._thread_pool = QThreadPool(self)
@@ -119,7 +122,7 @@ class MainWindow(QMainWindow):
 
         self._start_button = QPushButton("Start")
         self._stop_button = QPushButton("Stop")
-        self._refresh_button = QPushButton("Refresh")
+        self._refresh_button = QPushButton("Test 1 fetch")
         self._start_button.clicked.connect(self._start_stream)
         self._stop_button.clicked.connect(self._stop_stream)
         self._refresh_button.clicked.connect(self._refresh_once)
@@ -202,6 +205,12 @@ class MainWindow(QMainWindow):
     def _start_stream(self) -> None:
         if self._timer.isActive():
             return
+        logger.info(
+            "Start clicked | symbol={} | exchanges={} | interval={} ms",
+            self._pair_combo.currentText(),
+            sorted(self._selected_exchanges),
+            self._interval_spin.value(),
+        )
         self._timer.start(self._interval_spin.value())
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
@@ -218,14 +227,19 @@ class MainWindow(QMainWindow):
         logger.info("Streaming stopped")
 
     def _refresh_once(self) -> None:
-        self._refresh_quotes()
-        logger.info("Manual refresh triggered")
+        self._log_single_fetch = True
+        self._refresh_quotes(exchanges=["Binance"])
+        logger.info("Manual refresh triggered (Binance)")
 
-    def _refresh_quotes(self) -> None:
+    def _refresh_quotes(self, exchanges: list[str] | None = None) -> None:
         if self._fetch_in_progress:
             return
         pair = self._pair_combo.currentText()
-        exchanges = list(self._selected_exchanges)
+        exchanges = exchanges or list(self._selected_exchanges)
+        self._last_requested_pair = pair
+        self._last_requested_exchanges = exchanges
+        self._updates_count += 1
+        logger.info("tick #{}", self._updates_count)
         self._fetch_in_progress = True
         worker = QuoteFetchWorker(self._price_provider, self._quote_service, pair, exchanges)
         worker.signals.finished.connect(self._handle_quotes)
@@ -233,9 +247,20 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _handle_quotes(self, quotes: list[dict[str, object]]) -> None:
-        self._table_model.update_quotes(quotes)
-        self._updates_count += 1
-        self._errors_count = sum(1 for quote in quotes if str(quote.get("status", "")).lower() == "error")
+        logger.info("rows received: {}", len(quotes))
+        normalized = self._normalize_quotes(quotes, self._last_requested_exchanges)
+        if self._log_single_fetch:
+            statuses = [str(item.get("status", "")) for item in normalized]
+            has_numbers = any(
+                float(item.get("bid", 0.0)) or float(item.get("ask", 0.0)) or float(item.get("last", 0.0))
+                for item in normalized
+            )
+            logger.info("Test 1 fetch result | status={} | has_numbers={}", statuses, has_numbers)
+            self._log_single_fetch = False
+        self._table_model.update_quotes(normalized)
+        self._errors_count = sum(
+            1 for quote in normalized if str(quote.get("status", "")).lower() in {"error", "no_symbol"}
+        )
         self._last_update = datetime.now().strftime("%H:%M:%S")
         self._update_counters()
         self._fetch_in_progress = False
@@ -259,6 +284,85 @@ class MainWindow(QMainWindow):
     def _exchange_summary_text(self) -> str:
         count = len(self._selected_exchanges)
         return f"{count} selected"
+
+    def _normalize_quotes(
+        self,
+        quotes: list[dict[str, object]],
+        exchanges: list[str],
+    ) -> list[dict[str, object]]:
+        normalized: list[dict[str, object]] = []
+        for item in quotes:
+            normalized.append(self._normalize_quote_item(item))
+
+        if not normalized:
+            return [
+                {
+                    "exchange": exchange,
+                    "bid": 0.0,
+                    "ask": 0.0,
+                    "last": 0.0,
+                    "spread": 0.0,
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "status": "ERROR",
+                    "error": "No data",
+                }
+                for exchange in exchanges
+            ]
+
+        seen = {str(item.get("exchange", "")) for item in normalized}
+        missing = [exchange for exchange in exchanges if exchange not in seen]
+        if missing:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            normalized.extend(
+                {
+                    "exchange": exchange,
+                    "bid": 0.0,
+                    "ask": 0.0,
+                    "last": 0.0,
+                    "spread": 0.0,
+                    "timestamp": timestamp,
+                    "status": "ERROR",
+                    "error": "No data",
+                }
+                for exchange in missing
+            )
+        return normalized
+
+    def _normalize_quote_item(self, item: dict[str, object]) -> dict[str, object]:
+        exchange = (
+            item.get("exchange")
+            or item.get("exchange_name")
+            or item.get("market")
+            or item.get("name")
+            or ""
+        )
+        bid = item.get("bid")
+        if bid is None:
+            bid = item.get("bidPrice") or item.get("b")
+        ask = item.get("ask")
+        if ask is None:
+            ask = item.get("askPrice") or item.get("a")
+        last = item.get("last")
+        if last is None:
+            last = item.get("price") or item.get("lastPrice") or item.get("c")
+        spread = item.get("spread")
+        if spread is None and bid is not None and ask is not None:
+            try:
+                spread = float(ask) - float(bid)
+            except (TypeError, ValueError):
+                spread = 0.0
+        timestamp = item.get("timestamp") or item.get("time") or datetime.now().strftime("%H:%M:%S")
+        status = item.get("status") or item.get("state") or "ERROR"
+        return {
+            "exchange": str(exchange),
+            "bid": float(bid or 0.0),
+            "ask": float(ask or 0.0),
+            "last": float(last or 0.0),
+            "spread": float(spread or 0.0),
+            "timestamp": str(timestamp),
+            "status": str(status),
+            "error": item.get("error"),
+        }
 
     def _update_counters(self) -> None:
         self._active_label.setText(f"Active exchanges: {len(self._selected_exchanges)}")
