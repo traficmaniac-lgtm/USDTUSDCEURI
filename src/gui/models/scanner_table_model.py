@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtGui import QBrush, QColor
 
 
 @dataclass
@@ -66,6 +67,12 @@ class ScannerTableModel(QAbstractTableModel):
             if column in {2, 4, 5, 6, 7, 8, 9}:
                 return int(Qt.AlignRight | Qt.AlignVCenter)
             return int(Qt.AlignLeft | Qt.AlignVCenter)
+
+        if role == Qt.BackgroundRole:
+            if row.status == "LIVE":
+                return QBrush(QColor(221, 245, 221))
+            if row.status == "УГАСЛО":
+                return QBrush(QColor(240, 240, 240))
 
         return None
 
