@@ -8,6 +8,7 @@ from PySide6.QtCore import QObject, QTimer, Qt, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDockWidget,
     QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
@@ -70,11 +71,11 @@ class ScannerWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(self._build_settings_panel())
-        layout.addLayout(self._build_controls())
-        layout.addWidget(self._build_profit_panel())
-        layout.addLayout(self._build_status_log())
+        layout.addLayout(self._build_toolbar())
+        layout.addWidget(self._build_profit_panel(), stretch=3)
+        layout.addLayout(self._build_status_log(), stretch=1)
         self.setCentralWidget(central)
+        self._build_settings_dock()
         self._create_actions()
 
     def _create_actions(self) -> None:
@@ -82,9 +83,9 @@ class ScannerWindow(QMainWindow):
         close_action.triggered.connect(self.close)
         self.addAction(close_action)
 
-    def _build_settings_panel(self) -> QGroupBox:
-        group = QGroupBox("Настройки")
-        outer_layout = QVBoxLayout(group)
+    def _build_settings_panel(self) -> QWidget:
+        panel = QWidget()
+        outer_layout = QVBoxLayout(panel)
 
         grid_layout = QVBoxLayout()
 
@@ -123,7 +124,8 @@ class ScannerWindow(QMainWindow):
 
         outer_layout.addLayout(grid_layout)
         outer_layout.addWidget(self._build_exchanges_group())
-        return group
+        outer_layout.addStretch()
+        return panel
 
     def _build_exchanges_group(self) -> QGroupBox:
         group = QGroupBox("Биржи")
@@ -137,8 +139,11 @@ class ScannerWindow(QMainWindow):
         layout.addWidget(self._exchanges_list)
         return group
 
-    def _build_controls(self) -> QHBoxLayout:
+    def _build_toolbar(self) -> QHBoxLayout:
         layout = QHBoxLayout()
+        self._settings_toggle_button = QPushButton("⚙ Настройки")
+        self._settings_toggle_button.setCheckable(True)
+        self._settings_toggle_button.toggled.connect(self._toggle_settings_dock)
         self._start_button = QPushButton("Старт")
         self._stop_button = QPushButton("Стоп")
         self._clear_button = QPushButton("Очистить")
@@ -149,11 +154,28 @@ class ScannerWindow(QMainWindow):
 
         self._stop_button.setEnabled(False)
 
+        layout.addWidget(self._settings_toggle_button)
         layout.addWidget(self._start_button)
         layout.addWidget(self._stop_button)
         layout.addWidget(self._clear_button)
         layout.addStretch()
         return layout
+
+    def _build_settings_dock(self) -> None:
+        self._settings_dock = QDockWidget("Настройки", self)
+        self._settings_dock.setWidget(self._build_settings_panel())
+        self._settings_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self._settings_dock.visibilityChanged.connect(self._sync_settings_toggle)
+        self.addDockWidget(Qt.RightDockWidgetArea, self._settings_dock)
+        self._settings_dock.setVisible(False)
+
+    def _toggle_settings_dock(self, visible: bool) -> None:
+        if hasattr(self, "_settings_dock"):
+            self._settings_dock.setVisible(visible)
+
+    def _sync_settings_toggle(self, visible: bool) -> None:
+        if hasattr(self, "_settings_toggle_button"):
+            self._settings_toggle_button.setChecked(visible)
 
     def _build_profit_panel(self) -> QGroupBox:
         group = QGroupBox("Профитные")
