@@ -164,10 +164,12 @@ class ScannerWindow(QMainWindow):
         self._settings_toggle_button.toggled.connect(self._toggle_settings_dock)
         self._start_button = QPushButton("Старт")
         self._stop_button = QPushButton("Стоп")
+        self._refresh_markets_button = QPushButton("Обновить рынки")
         self._clear_button = QPushButton("Очистить")
 
         self._start_button.clicked.connect(self._start_scan)
         self._stop_button.clicked.connect(self._stop_scan)
+        self._refresh_markets_button.clicked.connect(self._refresh_markets)
         self._clear_button.clicked.connect(self._clear_scan)
 
         self._stop_button.setEnabled(False)
@@ -175,6 +177,7 @@ class ScannerWindow(QMainWindow):
         layout.addWidget(self._settings_toggle_button)
         layout.addWidget(self._start_button)
         layout.addWidget(self._stop_button)
+        layout.addWidget(self._refresh_markets_button)
         layout.addWidget(self._clear_button)
         layout.addStretch()
         return layout
@@ -306,10 +309,16 @@ class ScannerWindow(QMainWindow):
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
         self._log("Сканирование запущено")
-        self._log(f"Загружаем рынки: биржи={len(selected_exchanges)}")
+        self._log(f"Загружаем рынки: биржи={len(selected_exchanges)} (кэш)")
         self._set_stage_discovery(0, self._discovery_total_exchanges)
         self._update_status()
-        self._start_market_discovery(selected_exchanges, quotes, min_exchanges)
+        self._start_market_discovery(
+            selected_exchanges,
+            quotes,
+            min_exchanges,
+            use_cache=True,
+            refresh_cache=False,
+        )
 
     def _stop_scan(self) -> None:
         if not self._scanning:
@@ -342,6 +351,29 @@ class ScannerWindow(QMainWindow):
         self._log("Данные очищены")
         self._update_status()
 
+    def _refresh_markets(self) -> None:
+        if self._discovery_job is not None:
+            self._log("Обновление рынков уже выполняется")
+            return
+        selected_exchanges = self._selected_exchanges()
+        quotes = self._selected_quote_currencies()
+        min_exchanges = self._min_exchanges_spin.value()
+        self._selected_exchanges_count = len(selected_exchanges)
+        self._discovery_total_exchanges = len(selected_exchanges)
+        if self._scanning:
+            self._stop_ticker_scan()
+            self._log("Скан цен приостановлен для обновления рынков")
+        self._log("Обновляем рынки (загрузка с бирж)")
+        self._set_stage_discovery(0, self._discovery_total_exchanges)
+        self._update_status()
+        self._start_market_discovery(
+            selected_exchanges,
+            quotes,
+            min_exchanges,
+            use_cache=False,
+            refresh_cache=True,
+        )
+
     def _open_analysis(self, index=None) -> None:
         if index is None:
             selection = self._profit_table_view.selectionModel()
@@ -373,6 +405,8 @@ class ScannerWindow(QMainWindow):
         exchanges: list[str],
         quotes: list[str],
         min_exchanges: int,
+        use_cache: bool = True,
+        refresh_cache: bool = False,
     ) -> None:
         self._discovery_request_id += 1
         request_id = self._discovery_request_id
@@ -383,6 +417,8 @@ class ScannerWindow(QMainWindow):
                 exchanges,
                 quotes,
                 min_exchanges,
+                use_cache=use_cache,
+                refresh_cache=refresh_cache,
             ),
         )
         if not self._discovery_job:
@@ -394,10 +430,12 @@ class ScannerWindow(QMainWindow):
     def _cancel_market_discovery(self) -> None:
         self._discovery_request_id += 1
         self._update_controller.clear_key("scanner-discovery")
+        self._discovery_job = None
 
     def _on_discovery_finished(self, request_id: int, result: MarketDiscoveryResult) -> None:
         if request_id != self._discovery_request_id:
             return
+        self._discovery_job = None
         for exchange, count in result.exchange_counts.items():
             self._log(f"Рынки загружены: {exchange}={count}")
         min_exchanges = self._min_exchanges_spin.value()
@@ -422,12 +460,15 @@ class ScannerWindow(QMainWindow):
             else:
                 self._set_stage_scanning()
                 self._start_ticker_scan()
+        else:
+            self._set_stage_stopped()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
 
     def _on_discovery_failed(self, request_id: int, message: str) -> None:
         if request_id != self._discovery_request_id:
             return
+        self._discovery_job = None
         self._log(f"Ошибка поиска рынков: {message}")
         self._stop_ticker_scan()
         self._scanning = False
