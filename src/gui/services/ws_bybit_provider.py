@@ -1,4 +1,4 @@
-"""WebSocket provider for Binance quotes."""
+"""WebSocket provider for Bybit quotes."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ import websocket
 from .ws_base import WsProviderBase
 
 
-class BinanceWsProvider(WsProviderBase):
-    """Threaded WebSocket worker for Binance ticker updates."""
+class BybitWsProvider(WsProviderBase):
+    """Threaded WebSocket worker for Bybit ticker updates."""
 
-    STREAM_URL = "wss://stream.binance.com:9443/ws/{}@ticker"
+    STREAM_URL = "wss://stream.bybit.com/v5/public/spot"
 
     def __init__(
         self,
@@ -22,7 +22,7 @@ class BinanceWsProvider(WsProviderBase):
         on_error: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(
-            exchange_name="Binance",
+            exchange_name="Bybit",
             resolved_symbol=symbol,
             on_quote=on_quote,
             on_error=on_error,
@@ -30,14 +30,15 @@ class BinanceWsProvider(WsProviderBase):
 
     @staticmethod
     def stream_symbol(symbol: str) -> str:
-        return symbol.replace("/", "").lower()
+        return symbol.replace("/", "")
 
     def run(self) -> None:
-        stream_name = self.stream_symbol(self.resolved_symbol)
-        url = self.STREAM_URL.format(stream_name)
+        topic = f"tickers.{self.stream_symbol(self.resolved_symbol)}"
 
-        def on_open(_ws: websocket.WebSocketApp) -> None:
+        def on_open(ws: websocket.WebSocketApp) -> None:
             self._log_connected()
+            subscribe = {"op": "subscribe", "args": [topic]}
+            ws.send(json.dumps(subscribe))
 
         def on_close(_ws: websocket.WebSocketApp, _status: int, _message: str) -> None:
             self._log_disconnected()
@@ -52,10 +53,12 @@ class BinanceWsProvider(WsProviderBase):
                 payload = json.loads(message)
             except json.JSONDecodeError:
                 return
-            bid = payload.get("b")
-            ask = payload.get("a")
-            last = payload.get("c")
-            event_time = payload.get("E")
+            data = payload.get("data")
+            if not data:
+                return
+            bid = data.get("bid1Price")
+            ask = data.get("ask1Price")
+            last = data.get("lastPrice")
             if bid is None or ask is None or last is None:
                 return
             try:
@@ -64,10 +67,7 @@ class BinanceWsProvider(WsProviderBase):
                 last_value = float(last)
             except (TypeError, ValueError):
                 return
-            if event_time:
-                timestamp = self._format_timestamp(event_time)
-            else:
-                timestamp = self._format_timestamp(None)
+            timestamp = self._format_timestamp(data.get("ts") or payload.get("ts"))
             self._emit_quote(
                 bid=bid_value,
                 ask=ask_value,
@@ -77,7 +77,7 @@ class BinanceWsProvider(WsProviderBase):
             )
 
         self._ws = websocket.WebSocketApp(
-            url,
+            self.STREAM_URL,
             on_open=on_open,
             on_close=on_close,
             on_error=on_error,
