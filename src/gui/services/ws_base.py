@@ -84,6 +84,7 @@ class WsProviderBase(threading.Thread):
             "spread": spread,
             "timestamp": timestamp,
             "status": status,
+            "source": "WS",
         }
         if error:
             quote["error"] = error

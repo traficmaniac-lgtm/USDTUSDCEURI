@@ -44,6 +44,7 @@ class FakeQuoteService:
                     "timestamp": timestamp,
                     "status": status,
                     "pair": pair,
+                    "source": "HTTP",
                 }
             )
         return quotes
