@@ -68,6 +68,18 @@ class TickerScanService:
 
     _default_outlier_pct = 5.0
     _exchange_map = EXCHANGE_MAP
+    _exchange_timeout_ms = 8000
+
+    def _create_exchange(self, exchange_id: str) -> ccxt.Exchange:
+        exchange = getattr(ccxt, exchange_id)()
+        exchange.enableRateLimit = True
+        exchange.timeout = self._exchange_timeout_ms
+        if exchange_id == "binance":
+            options = getattr(exchange, "options", None)
+            if not isinstance(options, dict):
+                exchange.options = {}
+            exchange.options["defaultType"] = "spot"
+        return exchange
 
     def scan(
         self,
@@ -101,44 +113,45 @@ class TickerScanService:
             exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
             if not hasattr(ccxt, exchange_id):
                 continue
-            exchange = exchanges_cache.get(exchange_id)
-            if exchange is None:
-                exchange = getattr(ccxt, exchange_id)()
-                if exchange_id == "binance":
-                    options = getattr(exchange, "options", None)
-                    if not isinstance(options, dict):
-                        exchange.options = {}
-                    exchange.options["defaultType"] = "spot"
-                exchanges_cache[exchange_id] = exchange
-            symbol_list = sorted(symbols)
-            if exchange.has.get("fetchTickers"):
-                try:
-                    tickers = exchange.fetch_tickers(symbol_list)
-                except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
-                    fail_count += 1
-                    message = f"Ticker error: {exchange_label} batch: {exc}"
-                    errors.append(message)
-                    logger.warning(message)
+            try:
+                exchange = exchanges_cache.get(exchange_id)
+                if exchange is None:
+                    exchange = self._create_exchange(exchange_id)
+                    exchanges_cache[exchange_id] = exchange
+                symbol_list = sorted(symbols)
+                if exchange.has.get("fetchTickers"):
+                    try:
+                        tickers = exchange.fetch_tickers(symbol_list)
+                    except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
+                        fail_count += 1
+                        message = f"Ticker error: {exchange_label} batch: {exc}"
+                        errors.append(message)
+                        logger.warning(message)
+                        continue
+                    for symbol in symbol_list:
+                        ticker = tickers.get(symbol)
+                        if ticker is None:
+                            continue
+                        ticker_map[(symbol, exchange_label)] = ticker
+                        ok_count += 1
                     continue
+
                 for symbol in symbol_list:
-                    ticker = tickers.get(symbol)
-                    if ticker is None:
+                    try:
+                        ticker = exchange.fetch_ticker(symbol)
+                        ok_count += 1
+                    except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
+                        fail_count += 1
+                        message = f"Ticker error: {exchange_label} {symbol}: {exc}"
+                        errors.append(message)
+                        logger.warning(message)
                         continue
                     ticker_map[(symbol, exchange_label)] = ticker
-                    ok_count += 1
-                continue
-
-            for symbol in symbol_list:
-                try:
-                    ticker = exchange.fetch_ticker(symbol)
-                    ok_count += 1
-                except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
-                    fail_count += 1
-                    message = f"Ticker error: {exchange_label} {symbol}: {exc}"
-                    errors.append(message)
-                    logger.warning(message)
-                    continue
-                ticker_map[(symbol, exchange_label)] = ticker
+            except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
+                fail_count += 1
+                message = f"Ticker error: {exchange_label} setup: {exc}"
+                errors.append(message)
+                logger.warning(message)
 
         for pair in pairs_to_scan:
             entries: list[tuple[str, float, float, float, float | None]] = []
@@ -217,16 +230,11 @@ class TickerScanService:
                     )
                 )
                 continue
-            exchange = exchanges_cache.get(exchange_id)
-            if exchange is None:
-                exchange = getattr(ccxt, exchange_id)()
-                if exchange_id == "binance":
-                    options = getattr(exchange, "options", None)
-                    if not isinstance(options, dict):
-                        exchange.options = {}
-                    exchange.options["defaultType"] = "spot"
-                exchanges_cache[exchange_id] = exchange
             try:
+                exchange = exchanges_cache.get(exchange_id)
+                if exchange is None:
+                    exchange = self._create_exchange(exchange_id)
+                    exchanges_cache[exchange_id] = exchange
                 ticker = exchange.fetch_ticker(pair)
             except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
                 message = f"Ticker error: {exchange_label} {pair}: {exc}"
