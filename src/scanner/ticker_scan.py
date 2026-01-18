@@ -32,6 +32,7 @@ class TickerScanResult:
 
     updates: list[TickerScanUpdate]
     pair_count: int
+    skipped_count: int
     ok_count: int
     fail_count: int
     errors: list[str]
@@ -40,6 +41,7 @@ class TickerScanResult:
 class TickerScanService:
     """Service that fetches tickers and computes spreads."""
 
+    _default_outlier_pct = 5.0
     _exchange_map = {
         "Binance": "binance",
         "OKX": "okx",
@@ -58,53 +60,113 @@ class TickerScanService:
         pair_exchanges: dict[str, list[str]],
         max_pairs: int,
         pairs: list[str] | None = None,
+        max_intrabook_spread_pct: float | None = None,
+        outlier_pct: float | None = None,
     ) -> TickerScanResult:
         """Fetch tickers for the given pairs and compute spreads."""
         if pairs is None:
             pairs_to_scan = sorted(pair_exchanges.keys())[:max_pairs]
         else:
             pairs_to_scan = list(pairs)[:max_pairs]
+        if outlier_pct is None:
+            outlier_pct = self._default_outlier_pct
         exchanges_cache: dict[str, ccxt.Exchange] = {}
+        exchange_symbols: dict[str, set[str]] = {}
+        ticker_map: dict[tuple[str, str], dict] = {}
         updates: list[TickerScanUpdate] = []
         errors: list[str] = []
         ok_count = 0
         fail_count = 0
+        skipped_count = 0
 
         for pair in pairs_to_scan:
-            asks: list[tuple[float, str]] = []
-            bids: list[tuple[float, str]] = []
-            volumes: list[float] = []
-
             for exchange_label in pair_exchanges.get(pair, []):
-                exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
-                if not hasattr(ccxt, exchange_id):
-                    continue
-                exchange = exchanges_cache.get(exchange_id)
-                if exchange is None:
-                    exchange = getattr(ccxt, exchange_id)()
-                    if exchange_id == "binance":
-                        options = getattr(exchange, "options", None)
-                        if not isinstance(options, dict):
-                            exchange.options = {}
-                        exchange.options["defaultType"] = "spot"
-                    exchanges_cache[exchange_id] = exchange
+                exchange_symbols.setdefault(exchange_label, set()).add(pair)
+
+        for exchange_label, symbols in exchange_symbols.items():
+            exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
+            if not hasattr(ccxt, exchange_id):
+                continue
+            exchange = exchanges_cache.get(exchange_id)
+            if exchange is None:
+                exchange = getattr(ccxt, exchange_id)()
+                if exchange_id == "binance":
+                    options = getattr(exchange, "options", None)
+                    if not isinstance(options, dict):
+                        exchange.options = {}
+                    exchange.options["defaultType"] = "spot"
+                exchanges_cache[exchange_id] = exchange
+            symbol_list = sorted(symbols)
+            if exchange.has.get("fetchTickers"):
                 try:
-                    ticker = exchange.fetch_ticker(pair)
-                    ok_count += 1
+                    tickers = exchange.fetch_tickers(symbol_list)
                 except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
                     fail_count += 1
-                    message = f"Ticker error: {exchange_label} {pair}: {exc}"
+                    message = f"Ticker error: {exchange_label} batch: {exc}"
                     errors.append(message)
                     logger.warning(message)
                     continue
+                for symbol in symbol_list:
+                    ticker = tickers.get(symbol)
+                    if ticker is None:
+                        continue
+                    ticker_map[(symbol, exchange_label)] = ticker
+                    ok_count += 1
+                continue
 
+            for symbol in symbol_list:
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    ok_count += 1
+                except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
+                    fail_count += 1
+                    message = f"Ticker error: {exchange_label} {symbol}: {exc}"
+                    errors.append(message)
+                    logger.warning(message)
+                    continue
+                ticker_map[(symbol, exchange_label)] = ticker
+
+        for pair in pairs_to_scan:
+            entries: list[tuple[str, float, float, float, float | None]] = []
+            for exchange_label in pair_exchanges.get(pair, []):
+                ticker = ticker_map.get((pair, exchange_label))
+                if ticker is None:
+                    continue
                 bid = _as_float(ticker.get("bid"))
                 ask = _as_float(ticker.get("ask"))
-                if bid is not None and ask is not None:
-                    bids.append((bid, exchange_label))
-                    asks.append((ask, exchange_label))
-
+                if bid is None or ask is None or bid <= 0 or ask <= 0:
+                    continue
+                mid = (bid + ask) / 2
+                if max_intrabook_spread_pct is not None:
+                    intrabook = (ask - bid) / mid * 100
+                    if intrabook > max_intrabook_spread_pct:
+                        continue
                 volume = _pick_volume(ticker)
+                entries.append((exchange_label, bid, ask, mid, volume))
+
+            if len(entries) < 2:
+                skipped_count += 1
+                continue
+
+            mids = [entry[3] for entry in entries]
+            median_mid = median(mids)
+            valid_entries: list[tuple[str, float, float, float, float | None]] = []
+            for entry in entries:
+                mid = entry[3]
+                if abs(mid - median_mid) / median_mid * 100 > outlier_pct:
+                    continue
+                valid_entries.append(entry)
+
+            if len(valid_entries) < 2:
+                skipped_count += 1
+                continue
+
+            asks: list[tuple[float, str]] = []
+            bids: list[tuple[float, str]] = []
+            volumes: list[float] = []
+            for exchange_label, bid, ask, _mid, volume in valid_entries:
+                bids.append((bid, exchange_label))
+                asks.append((ask, exchange_label))
                 if volume is not None:
                     volumes.append(volume)
 
@@ -114,6 +176,7 @@ class TickerScanService:
         return TickerScanResult(
             updates=updates,
             pair_count=len(pairs_to_scan),
+            skipped_count=skipped_count,
             ok_count=ok_count,
             fail_count=fail_count,
             errors=errors,

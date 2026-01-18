@@ -392,11 +392,13 @@ class ScannerWindow(QMainWindow):
         self._stop_ticker_scan()
         interval_ms = self._scan_interval_spin.value()
         max_pairs = self._max_pairs_spin.value()
+        max_intrabook_spread_pct = self._max_spread_spin.value()
         self._ticker_worker = TickerScanWorker(
             pair_exchanges=self._pair_exchanges,
             eligible_pairs=self._eligible_pairs,
             max_pairs=max_pairs,
             interval_ms=interval_ms,
+            max_intrabook_spread_pct=max_intrabook_spread_pct,
         )
         self._ticker_thread = QThread(self)
         self._ticker_worker.moveToThread(self._ticker_thread)
@@ -468,8 +470,9 @@ class ScannerWindow(QMainWindow):
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
         self._log(
-            "Обновление: "
-            f"ok={result.ok_count} fail={result.fail_count}"
+            "Update: "
+            f"pairs={result.pair_count} ok={result.ok_count} "
+            f"skipped={result.skipped_count} fail={result.fail_count}"
         )
 
     def _log(self, message: str) -> None:
@@ -551,12 +554,14 @@ class TickerScanWorker(QObject):
         eligible_pairs: list[str],
         max_pairs: int,
         interval_ms: int,
+        max_intrabook_spread_pct: float,
     ) -> None:
         super().__init__()
         self._pair_exchanges = pair_exchanges
         self._eligible_pairs = eligible_pairs
         self._max_pairs = max_pairs
         self._interval_ms = interval_ms
+        self._max_intrabook_spread_pct = max_intrabook_spread_pct
         self._timer: QTimer | None = None
         self._stopped = False
 
@@ -583,6 +588,7 @@ class TickerScanWorker(QObject):
                 self._pair_exchanges,
                 self._max_pairs,
                 pairs=self._eligible_pairs,
+                max_intrabook_spread_pct=self._max_intrabook_spread_pct,
             )
         except Exception as exc:  # noqa: BLE001 - surface scan errors
             self.log.emit(f"Ошибка сканирования тикеров: {exc}")
