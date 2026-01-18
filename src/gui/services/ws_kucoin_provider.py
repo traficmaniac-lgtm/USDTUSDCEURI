@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import json
 import threading
 import time
@@ -29,6 +30,9 @@ class KuCoinWsProvider(WsProviderBase):
     ENABLED = True
     REST_ENDPOINT = "https://api.kucoin.com/api/v1/bullet-public"
     DEFAULT_PING_INTERVAL = 20.0
+    COOLDOWN = timedelta(seconds=60)
+    _cooldown_until: datetime | None = None
+    _cooldown_logged_at: datetime | None = None
 
     def __init__(
         self,
@@ -50,28 +54,53 @@ class KuCoinWsProvider(WsProviderBase):
 
     def _fetch_ws_config(self) -> KuCoinWsConfig | None:
         try:
-            response = httpx.get(self.REST_ENDPOINT, timeout=10)
+            response = httpx.post(
+                self.REST_ENDPOINT,
+                json={},
+                headers={"accept": "application/json"},
+                timeout=10,
+            )
             response.raise_for_status()
         except httpx.HTTPError as exc:
             self._emit_error(exc)
+            self._enter_cooldown(str(exc))
             return None
         data = response.json().get("data", {})
         token = data.get("token")
         servers = data.get("instanceServers") or []
         if not token or not servers:
             self._emit_error("KuCoin WS bootstrap missing token or server list")
+            self._enter_cooldown("KuCoin WS bootstrap missing token or server list")
             return None
         server = servers[0]
         endpoint = server.get("endpoint")
         ping_interval = server.get("pingInterval")
         if not endpoint:
             self._emit_error("KuCoin WS bootstrap missing endpoint")
+            self._enter_cooldown("KuCoin WS bootstrap missing endpoint")
             return None
         try:
             ping_seconds = float(ping_interval) / 1000 if ping_interval else self.DEFAULT_PING_INTERVAL
         except (TypeError, ValueError):
             ping_seconds = self.DEFAULT_PING_INTERVAL
         return KuCoinWsConfig(endpoint=endpoint, token=token, ping_interval=ping_seconds)
+
+    def _enter_cooldown(self, reason: str) -> None:
+        now = datetime.now()
+        self.__class__._cooldown_until = now + self.COOLDOWN
+        self._emit_quote(
+            bid=0.0,
+            ask=0.0,
+            last=0.0,
+            status="HTTP_ONLY",
+            error=reason,
+        )
+
+    def _cooldown_active(self) -> bool:
+        cooldown_until = self.__class__._cooldown_until
+        if cooldown_until and datetime.now() < cooldown_until:
+            return True
+        return False
 
     def _start_ping_loop(self, ws: websocket.WebSocketApp, interval: float) -> None:
         def _ping_loop() -> None:
@@ -85,6 +114,21 @@ class KuCoinWsProvider(WsProviderBase):
         self._ping_thread.start()
 
     def run(self) -> None:
+        if self._cooldown_active():
+            remaining = int((self.__class__._cooldown_until - datetime.now()).total_seconds())
+            message = f"KuCoin WS cooldown active ({remaining}s)"
+            last_logged = self.__class__._cooldown_logged_at
+            if not last_logged or (datetime.now() - last_logged) > timedelta(seconds=30):
+                self.__class__._cooldown_logged_at = datetime.now()
+                self._emit_error(message)
+            self._emit_quote(
+                bid=0.0,
+                ask=0.0,
+                last=0.0,
+                status="HTTP_ONLY",
+                error=message,
+            )
+            return
         config = self._fetch_ws_config()
         if not config:
             return
