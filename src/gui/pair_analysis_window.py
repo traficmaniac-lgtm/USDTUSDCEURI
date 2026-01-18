@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QMainWindow,
+    QMenu,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -60,6 +62,10 @@ class PairAnalysisWorker(QObject):
             self._timer.timeout.connect(self._run_scan)
         self._timer.start()
         self._run_scan()
+
+    def pause(self) -> None:
+        if self._timer:
+            self._timer.stop()
 
     def stop(self) -> None:
         self._stopped = True
@@ -119,21 +125,25 @@ class PairAnalysisWindow(QMainWindow):
         self,
         symbol: str,
         exchanges: list[str],
+        opportunity_threshold: float,
         interval_ms: int = 1000,
     ) -> None:
         super().__init__()
         self._symbol = symbol
         self._exchanges = list(exchanges)
+        self._opportunity_threshold = opportunity_threshold
         self._interval_ms = interval_ms
         self._worker_thread: QThread | None = None
         self._worker: PairAnalysisWorker | None = None
+        self._bad_updates_streak = 0
+        self._analysis_status = "ПАУЗА"
 
         self.setWindowTitle(f"Анализ пары: {symbol}")
         self.resize(1100, 820)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         self._build_ui()
-        self._start_worker()
+        self._set_analysis_status("ПАУЗА")
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -151,16 +161,22 @@ class PairAnalysisWindow(QMainWindow):
         self._pair_label = QLabel(self._symbol)
         self._pair_label.setStyleSheet("font-weight: 600;")
         layout.addWidget(self._pair_label)
+        self._status_title = QLabel("Статус:")
+        self._status_label = QLabel("ПАУЗА")
+        self._status_label.setStyleSheet("font-weight: 600; color: #666666;")
+        layout.addSpacing(16)
+        layout.addWidget(self._status_title)
+        layout.addWidget(self._status_label)
         layout.addStretch()
         self._start_button = QPushButton("Старт")
         self._stop_button = QPushButton("Стоп")
         self._refresh_button = QPushButton("Обновить")
         self._close_button = QPushButton("Закрыть")
         self._start_button.clicked.connect(self._start_worker)
-        self._stop_button.clicked.connect(self._stop_worker)
+        self._stop_button.clicked.connect(self._pause_worker)
         self._refresh_button.clicked.connect(self._refresh_worker)
         self._close_button.clicked.connect(self.close)
-        self._stop_button.setEnabled(True)
+        self._stop_button.setEnabled(False)
         layout.addWidget(self._start_button)
         layout.addWidget(self._stop_button)
         layout.addWidget(self._refresh_button)
@@ -224,6 +240,10 @@ class PairAnalysisWindow(QMainWindow):
         self._exchange_table.setAlternatingRowColors(True)
         self._exchange_table.horizontalHeader().setStretchLastSection(True)
         self._exchange_table.horizontalHeader().setDefaultSectionSize(140)
+        self._exchange_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._exchange_table.customContextMenuRequested.connect(
+            self._show_exchange_context_menu
+        )
         for row, exchange in enumerate(self._exchanges):
             self._exchange_table.setItem(row, 0, QTableWidgetItem(exchange))
         layout.addWidget(self._exchange_table)
@@ -241,6 +261,7 @@ class PairAnalysisWindow(QMainWindow):
             self._worker.start()
             self._start_button.setEnabled(False)
             self._stop_button.setEnabled(True)
+            self._bad_updates_streak = 0
             return
         self._worker = PairAnalysisWorker(
             symbol=self._symbol,
@@ -256,6 +277,14 @@ class PairAnalysisWindow(QMainWindow):
         self._worker_thread.start()
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
+        self._bad_updates_streak = 0
+
+    def _pause_worker(self) -> None:
+        if self._worker:
+            self._worker.pause()
+        self._start_button.setEnabled(True)
+        self._stop_button.setEnabled(False)
+        self._set_analysis_status("ПАУЗА")
 
     def _stop_worker(self) -> None:
         if self._worker:
@@ -274,17 +303,43 @@ class PairAnalysisWindow(QMainWindow):
     def _refresh_worker(self) -> None:
         if self._worker:
             self._worker.refresh()
+        else:
+            self._start_worker()
+            if self._worker:
+                self._worker.pause()
 
     def _on_snapshot(self, snapshot: PairAnalysisSnapshot) -> None:
-        self._update_table(snapshot.entries)
+        if not self._has_valid_data(snapshot):
+            self._bad_updates_streak += 1
+            self._set_analysis_status("ОШИБКА")
+            self._append_error_history()
+            if self._bad_updates_streak >= 5:
+                self._auto_pause_for_bad_data()
+            return
+        self._bad_updates_streak = 0
+        self._update_table(
+            snapshot.entries, snapshot.best_buy_exchange, snapshot.best_sell_exchange
+        )
         self._update_summary(snapshot)
+        self._update_status_from_spread(snapshot.spread_pct)
+        self._append_history(snapshot)
 
-    def _update_table(self, entries: list[PairExchangeTicker]) -> None:
+    def _update_table(
+        self,
+        entries: list[PairExchangeTicker],
+        best_buy_exchange: str | None,
+        best_sell_exchange: str | None,
+    ) -> None:
         entry_map = {entry.exchange: entry for entry in entries}
         for row, exchange in enumerate(self._exchanges):
+            background = None
+            if exchange == best_buy_exchange:
+                background = QColor(220, 245, 224)
+            elif exchange == best_sell_exchange:
+                background = QColor(227, 241, 255)
             entry = entry_map.get(exchange)
             if entry is None:
-                self._set_table_row(row, exchange, None, None, None, None, "—")
+                self._set_table_row(row, exchange, None, None, None, None, "—", background)
                 continue
             spread_pct = None
             if entry.bid and entry.ask and entry.bid > 0 and entry.ask > 0:
@@ -299,6 +354,7 @@ class PairAnalysisWindow(QMainWindow):
                 spread_pct,
                 entry.volume_24h,
                 entry.status,
+                background,
             )
 
     def _set_table_row(
@@ -310,13 +366,20 @@ class PairAnalysisWindow(QMainWindow):
         spread_pct: float | None,
         volume_24h: float | None,
         status: str,
+        background: QColor | None,
     ) -> None:
-        self._exchange_table.setItem(row, 0, QTableWidgetItem(exchange))
-        self._exchange_table.setItem(row, 1, QTableWidgetItem(_fmt_value(bid)))
-        self._exchange_table.setItem(row, 2, QTableWidgetItem(_fmt_value(ask)))
-        self._exchange_table.setItem(row, 3, QTableWidgetItem(_fmt_pct(spread_pct)))
-        self._exchange_table.setItem(row, 4, QTableWidgetItem(_fmt_value(volume_24h)))
-        self._exchange_table.setItem(row, 5, QTableWidgetItem(status))
+        items = [
+            QTableWidgetItem(exchange),
+            QTableWidgetItem(_fmt_value(bid)),
+            QTableWidgetItem(_fmt_value(ask)),
+            QTableWidgetItem(_fmt_pct(spread_pct)),
+            QTableWidgetItem(_fmt_value(volume_24h)),
+            QTableWidgetItem(status),
+        ]
+        for column, item in enumerate(items):
+            if background is not None:
+                item.setBackground(background)
+            self._exchange_table.setItem(row, column, item)
 
     def _update_summary(self, snapshot: PairAnalysisSnapshot) -> None:
         self._best_buy_label.setText(_fmt_best(snapshot.best_buy_exchange, snapshot.buy_ask))
@@ -331,7 +394,7 @@ class PairAnalysisWindow(QMainWindow):
         net_profit, net_spread_pct = self._calculate_net(snapshot)
         self._net_spread_label.setText(_fmt_pct_value(net_spread_pct, net_profit))
         self._net_profit_label.setText(_fmt_value(net_profit))
-        self._append_history(snapshot, net_profit, net_spread_pct)
+        self._style_net_profit_label(net_profit)
 
     def _calculate_net(
         self, snapshot: PairAnalysisSnapshot
@@ -350,20 +413,17 @@ class PairAnalysisWindow(QMainWindow):
         net_spread_pct = net_profit / buy_cost * 100
         return net_profit, net_spread_pct
 
-    def _append_history(
-        self,
-        snapshot: PairAnalysisSnapshot,
-        net_profit: float | None,
-        net_spread_pct: float | None,
-    ) -> None:
+    def _append_history(self, snapshot: PairAnalysisSnapshot) -> None:
+        net_profit, net_spread_pct = self._calculate_net(snapshot)
         timestamp = datetime.now().strftime("%H:%M:%S")
-        buy_text = _fmt_best(snapshot.best_buy_exchange, snapshot.buy_ask)
-        sell_text = _fmt_best(snapshot.best_sell_exchange, snapshot.sell_bid)
+        buy_text = _fmt_exchange_price(snapshot.best_buy_exchange, snapshot.buy_ask)
+        sell_text = _fmt_exchange_price(snapshot.best_sell_exchange, snapshot.sell_bid)
+        gross_text = _fmt_pct(snapshot.spread_pct)
         net_pct_text = _fmt_pct(net_spread_pct)
         net_profit_text = _fmt_value(net_profit)
         line = (
-            f"{timestamp} | buy@ {buy_text} | sell@ {sell_text} | "
-            f"net {net_pct_text} | net$ {net_profit_text}"
+            f"{timestamp} | BUY {buy_text} | SELL {sell_text} | "
+            f"gross {gross_text} | net {net_pct_text} | net$ {net_profit_text}"
         )
         self._add_history_line(line)
 
@@ -375,6 +435,85 @@ class PairAnalysisWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._stop_worker()
         super().closeEvent(event)
+
+    def _set_analysis_status(self, status: str) -> None:
+        self._analysis_status = status
+        color = "#666666"
+        if status == "LIVE":
+            color = "#1b7f2a"
+        elif status == "УГАСЛО":
+            color = "#7a7a7a"
+        elif status == "ОШИБКА":
+            color = "#b00020"
+        elif status == "ПАУЗА":
+            color = "#666666"
+        self._status_label.setText(status)
+        self._status_label.setStyleSheet(f"font-weight: 600; color: {color};")
+
+    def _update_status_from_spread(self, spread_pct: float | None) -> None:
+        if spread_pct is None:
+            self._set_analysis_status("ОШИБКА")
+            return
+        if spread_pct >= self._opportunity_threshold:
+            self._set_analysis_status("LIVE")
+        else:
+            self._set_analysis_status("УГАСЛО")
+
+    def _has_valid_data(self, snapshot: PairAnalysisSnapshot) -> bool:
+        valid_exchanges = sum(
+            1
+            for entry in snapshot.entries
+            if entry.bid is not None
+            and entry.ask is not None
+            and entry.bid > 0
+            and entry.ask > 0
+        )
+        if valid_exchanges < 2:
+            return False
+        if snapshot.buy_ask is None or snapshot.sell_bid is None:
+            return False
+        return True
+
+    def _append_error_history(self) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._add_history_line(f"{timestamp} | ОШИБКА: недостаточно данных")
+
+    def _auto_pause_for_bad_data(self) -> None:
+        self._pause_worker()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._add_history_line(
+            f"{timestamp} | Авто-пауза: нет валидных данных 5 обновлений"
+        )
+
+    def _style_net_profit_label(self, net_profit: float | None) -> None:
+        if net_profit is None:
+            self._net_profit_label.setStyleSheet("color: #666666;")
+            return
+        if net_profit > 0:
+            self._net_profit_label.setStyleSheet("font-weight: 600; color: #1b7f2a;")
+        else:
+            self._net_profit_label.setStyleSheet("color: #666666;")
+
+    def _show_exchange_context_menu(self, position) -> None:
+        index = self._exchange_table.indexAt(position)
+        if not index.isValid():
+            return
+        row = index.row()
+        menu = QMenu(self)
+        copy_action = QAction("Копировать строку", self)
+        copy_action.triggered.connect(lambda: self._copy_exchange_row(row))
+        menu.addAction(copy_action)
+        menu.exec(self._exchange_table.viewport().mapToGlobal(position))
+
+    def _copy_exchange_row(self, row: int) -> None:
+        exchange_item = self._exchange_table.item(row, 0)
+        bid_item = self._exchange_table.item(row, 1)
+        ask_item = self._exchange_table.item(row, 2)
+        exchange = exchange_item.text() if exchange_item else "—"
+        bid = bid_item.text() if bid_item else "—"
+        ask = ask_item.text() if ask_item else "—"
+        text = f"{exchange} | bid: {bid} | ask: {ask}"
+        QGuiApplication.clipboard().setText(text)
 
 
 def _fmt_value(value: float | None) -> str:
@@ -401,3 +540,10 @@ def _fmt_best(exchange: str | None, price: float | None) -> str:
     if exchange is None or price is None:
         return "—"
     return f"{exchange} @ {price:,.6f}".rstrip("0").rstrip(".")
+
+
+def _fmt_exchange_price(exchange: str | None, price: float | None) -> str:
+    if exchange is None or price is None:
+        return "—"
+    price_text = f"{price:,.6f}".rstrip("0").rstrip(".")
+    return f"{exchange}@{price_text}"

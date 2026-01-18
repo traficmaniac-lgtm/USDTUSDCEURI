@@ -320,7 +320,8 @@ class ScannerWindow(QMainWindow):
             existing.activateWindow()
             return
         selected_exchanges = self._selected_exchanges()
-        window = PairAnalysisWindow(pair, selected_exchanges)
+        threshold = self._opportunity_threshold_spin.value()
+        window = PairAnalysisWindow(pair, selected_exchanges, threshold)
         window.destroyed.connect(lambda: self._analysis_windows.pop(pair, None))
         self._analysis_windows[pair] = window
         self._log(f"Открыто окно анализа: {pair}")
@@ -489,10 +490,12 @@ class ScannerWindow(QMainWindow):
         scanning_state = "ВКЛ" if self._scanning else "ВЫКЛ"
         eligible = len(self._eligible_pairs)
         profit_count = len(self._profit_rows)
+        live_count = sum(1 for row in self._profit_rows if row.status == "LIVE")
         self._status_label.setText(
             "Сканирование: "
             f"{scanning_state} | Eligible: {eligible} | "
-            f"Профитные: {profit_count} | Обновлено: {self._last_updated}"
+            f"Профитные: {profit_count} | LIVE: {live_count} | "
+            f"Обновлено: {self._last_updated}"
         )
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
