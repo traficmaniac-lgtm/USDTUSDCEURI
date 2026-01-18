@@ -68,6 +68,7 @@ class TickerScanService:
 
     _default_outlier_pct = 5.0
     _exchange_map = EXCHANGE_MAP
+    _timeout_ms = 10_000
 
     def scan(
         self,
@@ -103,7 +104,9 @@ class TickerScanService:
                 continue
             exchange = exchanges_cache.get(exchange_id)
             if exchange is None:
-                exchange = getattr(ccxt, exchange_id)()
+                exchange = getattr(ccxt, exchange_id)(
+                    {"enableRateLimit": True, "timeout": self._timeout_ms}
+                )
                 if exchange_id == "binance":
                     options = getattr(exchange, "options", None)
                     if not isinstance(options, dict):
@@ -219,7 +222,9 @@ class TickerScanService:
                 continue
             exchange = exchanges_cache.get(exchange_id)
             if exchange is None:
-                exchange = getattr(ccxt, exchange_id)()
+                exchange = getattr(ccxt, exchange_id)(
+                    {"enableRateLimit": True, "timeout": self._timeout_ms}
+                )
                 if exchange_id == "binance":
                     options = getattr(exchange, "options", None)
                     if not isinstance(options, dict):
