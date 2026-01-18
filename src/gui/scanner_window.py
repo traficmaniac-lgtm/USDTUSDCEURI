@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import time
 
 from PySide6.QtCore import QObject, QTimer, Qt, QThread, Signal
 from PySide6.QtGui import QAction
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTableView,
@@ -64,10 +66,15 @@ class ScannerWindow(QMainWindow):
         self._pair_exchanges: dict[str, list[str]] = {}
         self._selected_exchanges_count = 0
         self._analysis_windows: dict[str, PairAnalysisWindow] = {}
+        self._last_scan_ts: float | None = None
+        self._heartbeat_timer: QTimer | None = None
+        self._discovery_total_exchanges = 0
 
         self._build_ui()
+        self._start_heartbeat_timer()
         self._log("Окно сканера открыто")
         self._update_status()
+        self._set_stage_stopped()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -197,8 +204,22 @@ class ScannerWindow(QMainWindow):
 
     def _build_status_log(self) -> QVBoxLayout:
         layout = QVBoxLayout()
+        status_layout = QHBoxLayout()
         self._status_label = QLabel()
-        layout.addWidget(self._status_label)
+        self._stage_label = QLabel()
+        self._heartbeat_label = QLabel()
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)
+        self._progress_bar.setVisible(False)
+        status_layout.addWidget(self._status_label)
+        status_layout.addSpacing(12)
+        status_layout.addWidget(self._stage_label)
+        status_layout.addSpacing(12)
+        status_layout.addWidget(self._progress_bar)
+        status_layout.addSpacing(12)
+        status_layout.addWidget(self._heartbeat_label)
+        status_layout.addStretch()
+        layout.addLayout(status_layout)
 
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
@@ -264,15 +285,18 @@ class ScannerWindow(QMainWindow):
         quotes = self._selected_quote_currencies()
         min_exchanges = self._min_exchanges_spin.value()
         self._selected_exchanges_count = len(selected_exchanges)
+        self._discovery_total_exchanges = len(selected_exchanges)
         self._eligible_pairs = []
         self._pair_exchanges = {}
         self._profit_rows = []
         self._profit_table_model.set_rows([])
         self._scanning = True
+        self._last_scan_ts = None
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
         self._log("Сканирование запущено")
         self._log(f"Загружаем рынки: биржи={len(selected_exchanges)}")
+        self._set_stage_discovery(0, self._discovery_total_exchanges)
         self._update_status()
         self._start_market_discovery(selected_exchanges, quotes, min_exchanges)
 
@@ -282,8 +306,10 @@ class ScannerWindow(QMainWindow):
         self._cancel_market_discovery()
         self._stop_ticker_scan()
         self._scanning = False
+        self._last_scan_ts = None
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
+        self._set_stage_stopped()
         self._log("Сканирование остановлено")
         self._update_status()
 
@@ -295,9 +321,11 @@ class ScannerWindow(QMainWindow):
         self._profit_rows = []
         self._profit_table_model.set_rows([])
         self._scanning = False
+        self._last_scan_ts = None
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._last_updated = "—"
+        self._set_stage_stopped()
         self._log("Данные очищены")
         self._update_status()
 
@@ -345,6 +373,7 @@ class ScannerWindow(QMainWindow):
         self._discovery_worker.moveToThread(self._discovery_thread)
         self._discovery_thread.started.connect(self._discovery_worker.run)
         self._discovery_worker.log.connect(self._log)
+        self._discovery_worker.progress.connect(self._on_discovery_progress)
         self._discovery_worker.finished.connect(self._on_discovery_finished)
         self._discovery_worker.failed.connect(self._on_discovery_failed)
         self._discovery_worker.finished.connect(self._discovery_thread.quit)
@@ -375,12 +404,15 @@ class ScannerWindow(QMainWindow):
             min_exchanges = self._min_exchanges_spin.value()
             if not self._eligible_pairs:
                 self._log("Скан цен не запущен: нет eligible пар")
+                self._set_stage_stopped()
             elif self._selected_exchanges_count < min_exchanges:
                 self._log(
                     "Скан цен не запущен: выберите больше бирж "
                     f"(нужно >= {min_exchanges})"
                 )
+                self._set_stage_stopped()
             else:
+                self._set_stage_scanning()
                 self._start_ticker_scan()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
@@ -391,8 +423,10 @@ class ScannerWindow(QMainWindow):
         self._log(f"Ошибка поиска рынков: {message}")
         self._stop_ticker_scan()
         self._scanning = False
+        self._last_scan_ts = None
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
+        self._set_stage_stopped()
         self._update_status()
 
     def _start_ticker_scan(self) -> None:
@@ -474,6 +508,7 @@ class ScannerWindow(QMainWindow):
                     row.volume_24h = update.volume_24h
                     row.status = "УГАСЛО"
         self._profit_table_model.set_rows(self._profit_rows)
+        self._last_scan_ts = time.monotonic()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
         self._log(
@@ -498,10 +533,42 @@ class ScannerWindow(QMainWindow):
             f"Обновлено: {self._last_updated}"
         )
 
+    def _start_heartbeat_timer(self) -> None:
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(500)
+        self._heartbeat_timer.timeout.connect(self._update_heartbeat)
+        self._heartbeat_timer.start()
+        self._update_heartbeat()
+
+    def _update_heartbeat(self) -> None:
+        if self._last_scan_ts is None:
+            self._heartbeat_label.setText("Последний ответ: —")
+            return
+        elapsed = time.monotonic() - self._last_scan_ts
+        self._heartbeat_label.setText(f"Последний ответ: {elapsed:.1f}с назад")
+
+    def _set_stage_discovery(self, current: int, total: int) -> None:
+        total_text = total if total > 0 else "—"
+        self._stage_label.setText(f"Этап: Загрузка рынков ({current}/{total_text})")
+        self._progress_bar.setVisible(True)
+
+    def _set_stage_scanning(self) -> None:
+        self._stage_label.setText("Этап: Сканирование тикеров")
+        self._progress_bar.setVisible(True)
+
+    def _set_stage_stopped(self) -> None:
+        self._stage_label.setText("Этап: Остановлено")
+        self._progress_bar.setVisible(False)
+
+    def _on_discovery_progress(self, current: int, total: int) -> None:
+        self._set_stage_discovery(current, total)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._cancel_market_discovery()
         self._stop_ticker_scan()
         self._scanning = False
+        self._last_scan_ts = None
+        self._set_stage_stopped()
         self._update_status()
         super().closeEvent(event)
 
@@ -512,6 +579,7 @@ class MarketDiscoveryWorker(QObject):
     finished = Signal(int, MarketDiscoveryResult)
     failed = Signal(int, str)
     log = Signal(str)
+    progress = Signal(int, int)
 
     def __init__(
         self,
@@ -538,6 +606,7 @@ class MarketDiscoveryWorker(QObject):
                 self._quotes,
                 self._min_exchanges,
                 should_cancel=self._is_cancelled,
+                progress_cb=self._emit_progress,
             )
         except Exception as exc:  # noqa: BLE001 - surface discovery errors in UI
             self.failed.emit(self._request_id, str(exc))
@@ -548,6 +617,10 @@ class MarketDiscoveryWorker(QObject):
 
     def _is_cancelled(self) -> bool:
         return self._cancelled
+
+    def _emit_progress(self, current: int, total: int) -> None:
+        if not self._cancelled:
+            self.progress.emit(current, total)
 
 
 class TickerScanWorker(QObject):

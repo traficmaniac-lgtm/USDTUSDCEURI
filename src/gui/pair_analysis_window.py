@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import time
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QGuiApplication
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QMainWindow,
     QMenu,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -44,6 +46,7 @@ class PairAnalysisWorker(QObject):
     """Worker to refresh pair analysis data without blocking UI."""
 
     updated = Signal(PairAnalysisSnapshot)
+    scan_started = Signal()
     stopped = Signal()
 
     def __init__(self, symbol: str, exchanges: list[str], interval_ms: int) -> None:
@@ -79,6 +82,7 @@ class PairAnalysisWorker(QObject):
     def _run_scan(self) -> None:
         if self._stopped:
             return
+        self.scan_started.emit()
         service = TickerScanService()
         entries, errors = service.fetch_pair_tickers(self._symbol, self._exchanges)
         best_buy_exchange = None
@@ -137,6 +141,8 @@ class PairAnalysisWindow(QMainWindow):
         self._worker: PairAnalysisWorker | None = None
         self._bad_updates_streak = 0
         self._analysis_status = "ПАУЗА"
+        self._slow_update = False
+        self._refresh_started_ts: float | None = None
 
         self.setWindowTitle(f"Анализ пары: {symbol}")
         self.resize(1100, 820)
@@ -167,6 +173,21 @@ class PairAnalysisWindow(QMainWindow):
         layout.addSpacing(16)
         layout.addWidget(self._status_title)
         layout.addWidget(self._status_label)
+        layout.addSpacing(16)
+        self._refresh_progress = QProgressBar()
+        self._refresh_progress.setRange(0, 0)
+        self._refresh_progress.setMaximumWidth(120)
+        self._refresh_progress.setVisible(False)
+        self._last_update_title = QLabel("Последнее обновление:")
+        self._last_update_label = QLabel("—")
+        self._latency_title = QLabel("Задержка:")
+        self._latency_label = QLabel("—")
+        layout.addWidget(self._refresh_progress)
+        layout.addWidget(self._last_update_title)
+        layout.addWidget(self._last_update_label)
+        layout.addSpacing(8)
+        layout.addWidget(self._latency_title)
+        layout.addWidget(self._latency_label)
         layout.addStretch()
         self._start_button = QPushButton("Старт")
         self._stop_button = QPushButton("Стоп")
@@ -272,6 +293,7 @@ class PairAnalysisWindow(QMainWindow):
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.start)
         self._worker.updated.connect(self._on_snapshot)
+        self._worker.scan_started.connect(self._on_scan_started)
         self._worker.stopped.connect(self._worker_thread.quit)
         self._worker_thread.finished.connect(self._on_worker_finished)
         self._worker_thread.start()
@@ -309,6 +331,7 @@ class PairAnalysisWindow(QMainWindow):
                 self._worker.pause()
 
     def _on_snapshot(self, snapshot: PairAnalysisSnapshot) -> None:
+        self._finalize_refresh()
         if not self._has_valid_data(snapshot):
             self._bad_updates_streak += 1
             self._set_analysis_status("ОШИБКА")
@@ -323,6 +346,24 @@ class PairAnalysisWindow(QMainWindow):
         self._update_summary(snapshot)
         self._update_status_from_spread(snapshot.spread_pct)
         self._append_history(snapshot)
+
+    def _on_scan_started(self) -> None:
+        self._refresh_started_ts = time.monotonic()
+        self._refresh_progress.setVisible(True)
+
+    def _finalize_refresh(self) -> None:
+        now = time.monotonic()
+        latency_ms = None
+        if self._refresh_started_ts is not None:
+            latency_ms = (now - self._refresh_started_ts) * 1000
+        self._refresh_progress.setVisible(False)
+        self._last_update_label.setText(datetime.now().strftime("%H:%M:%S"))
+        if latency_ms is None:
+            self._latency_label.setText("—")
+            self._slow_update = False
+        else:
+            self._latency_label.setText(f"{latency_ms:.0f} ms")
+            self._slow_update = latency_ms > 4000
 
     def _update_table(
         self,
@@ -447,7 +488,10 @@ class PairAnalysisWindow(QMainWindow):
             color = "#b00020"
         elif status == "ПАУЗА":
             color = "#666666"
-        self._status_label.setText(status)
+        status_text = status
+        if self._slow_update:
+            status_text = f"{status} · Долго… (возможен rate-limit)"
+        self._status_label.setText(status_text)
         self._status_label.setStyleSheet(f"font-weight: 600; color: {color};")
 
     def _update_status_from_spread(self, spread_pct: float | None) -> None:
@@ -491,6 +535,8 @@ class PairAnalysisWindow(QMainWindow):
             return
         if net_profit > 0:
             self._net_profit_label.setStyleSheet("font-weight: 600; color: #1b7f2a;")
+        elif net_profit < 0:
+            self._net_profit_label.setStyleSheet("color: #b00020;")
         else:
             self._net_profit_label.setStyleSheet("color: #666666;")
 

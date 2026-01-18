@@ -68,11 +68,11 @@ class ScannerTableModel(QAbstractTableModel):
                 return int(Qt.AlignRight | Qt.AlignVCenter)
             return int(Qt.AlignLeft | Qt.AlignVCenter)
 
-        if role == Qt.BackgroundRole:
+        if role == Qt.ForegroundRole and column == 10:
             if row.status == "LIVE":
-                return QBrush(QColor(221, 245, 221))
+                return QBrush(QColor(27, 127, 42))
             if row.status == "УГАСЛО":
-                return QBrush(QColor(240, 240, 240))
+                return QBrush(QColor(122, 122, 122))
 
         return None
 
