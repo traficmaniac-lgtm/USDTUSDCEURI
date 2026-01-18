@@ -311,6 +311,7 @@ class CcxtPriceProvider:
             "timestamp": timestamp,
             "status": status,
             "pair": pair,
+            "source": "HTTP",
         }
         if error:
             payload["error"] = error
