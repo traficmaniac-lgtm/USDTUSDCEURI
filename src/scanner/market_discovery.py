@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Iterable
 
 import ccxt
+
+from .market_cache import MarketCache
 
 
 @dataclass(frozen=True)
@@ -55,12 +58,15 @@ class MarketDiscoveryService:
         min_exchanges: int,
         should_cancel: Callable[[], bool] | None = None,
         progress_cb: Callable[[int, int], None] | None = None,
+        use_cache: bool = True,
+        refresh_cache: bool = False,
     ) -> MarketDiscoveryResult:
         """Load markets and return eligible pairs."""
         exchanges_list = list(exchanges)
         quotes_set = {quote.upper() for quote in quotes}
         pair_exchanges: dict[str, set[str]] = {}
         exchange_counts: dict[str, int] = {}
+        cache = MarketCache()
 
         total = len(exchanges_list)
         for index, exchange_label in enumerate(exchanges_list, start=1):
@@ -69,14 +75,21 @@ class MarketDiscoveryService:
             exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
             if not hasattr(ccxt, exchange_id):
                 continue
-            exchange = getattr(ccxt, exchange_id)()
-            if exchange_id == "binance":
-                options = getattr(exchange, "options", None)
-                if not isinstance(options, dict):
-                    exchange.options = {}
-                exchange.options["defaultType"] = "spot"
-            markets = exchange.load_markets()
-            filtered, stats = self._filter_markets(markets.values(), quotes_set)
+            markets = None
+            cache_used = False
+            if use_cache and not refresh_cache:
+                markets = cache.load(exchange_id)
+                cache_used = markets is not None
+            if markets is None:
+                exchange = getattr(ccxt, exchange_id)()
+                if exchange_id == "binance":
+                    options = getattr(exchange, "options", None)
+                    if not isinstance(options, dict):
+                        exchange.options = {}
+                    exchange.options["defaultType"] = "spot"
+                markets = list(exchange.load_markets().values())
+                cache.save(exchange_id, markets, saved_at=datetime.now().isoformat())
+            filtered, stats = self._filter_markets(markets, quotes_set)
             logger.info(
                 "Markets stats: %s total=%d | spot=%d | active=%d | quote=%d | final=%d",
                 exchange_label,
@@ -86,6 +99,8 @@ class MarketDiscoveryService:
                 stats.pass_quote,
                 stats.final,
             )
+            if cache_used:
+                logger.info("Markets cache hit: %s", exchange_label)
             exchange_counts[exchange_label] = len(filtered)
             for symbol in filtered:
                 pair_exchanges.setdefault(symbol, set()).add(exchange_label)
