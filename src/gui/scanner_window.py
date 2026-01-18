@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from .models.scanner_table_model import ScannerRow, ScannerTableModel
 from ..scanner.market_discovery import MarketDiscoveryResult, MarketDiscoveryService
+from ..scanner.ticker_scan import TickerScanResult, TickerScanService
 
 
 class ScannerWindow(QMainWindow):
@@ -55,6 +56,9 @@ class ScannerWindow(QMainWindow):
         self._discovery_thread: QThread | None = None
         self._discovery_worker: MarketDiscoveryWorker | None = None
         self._discovery_request_id = 0
+        self._ticker_thread: QThread | None = None
+        self._ticker_worker: TickerScanWorker | None = None
+        self._pair_exchanges: dict[str, list[str]] = {}
 
         self._build_ui()
         self._log("Scanner window opened")
@@ -233,6 +237,7 @@ class ScannerWindow(QMainWindow):
         quotes = self._selected_quote_currencies()
         min_exchanges = self._min_exchanges_spin.value()
         self._rows = []
+        self._pair_exchanges = {}
         self._table_model.set_rows([])
         self._scanning = True
         self._start_button.setEnabled(False)
@@ -246,6 +251,7 @@ class ScannerWindow(QMainWindow):
         if not self._scanning:
             return
         self._cancel_market_discovery()
+        self._stop_ticker_scan()
         self._scanning = False
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
@@ -254,7 +260,9 @@ class ScannerWindow(QMainWindow):
 
     def _clear_scan(self) -> None:
         self._cancel_market_discovery()
+        self._stop_ticker_scan()
         self._rows = []
+        self._pair_exchanges = {}
         self._table_model.set_rows([])
         self._scanning = False
         self._start_button.setEnabled(True)
@@ -313,6 +321,7 @@ class ScannerWindow(QMainWindow):
             self._log(f"Markets loaded: {exchange}={count}")
         min_exchanges = self._min_exchanges_spin.value()
         self._log(f"Eligible pairs: {len(result.eligible_pairs)} (min exchanges={min_exchanges})")
+        self._pair_exchanges = result.pair_exchanges
         self._rows = [
             ScannerRow(
                 pair=pair,
@@ -325,14 +334,13 @@ class ScannerWindow(QMainWindow):
                 volume_24h=None,
                 stable_hits=None,
                 score=None,
-                status=f"eligible ({len(result.pair_exchanges.get(pair, []))})",
+                status="—",
             )
             for pair in result.eligible_pairs
         ]
         self._table_model.set_rows(self._rows)
-        self._scanning = False
-        self._start_button.setEnabled(True)
-        self._stop_button.setEnabled(False)
+        if self._scanning:
+            self._start_ticker_scan()
         self._last_updated = datetime.now().strftime("%H:%M:%S")
         self._update_status()
 
@@ -340,10 +348,60 @@ class ScannerWindow(QMainWindow):
         if request_id != self._discovery_request_id:
             return
         self._log(f"Market discovery error: {message}")
+        self._stop_ticker_scan()
         self._scanning = False
         self._start_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._update_status()
+
+    def _start_ticker_scan(self) -> None:
+        self._stop_ticker_scan()
+        interval_ms = self._scan_interval_spin.value()
+        max_pairs = self._max_pairs_spin.value()
+        self._ticker_worker = TickerScanWorker(
+            pair_exchanges=self._pair_exchanges,
+            max_pairs=max_pairs,
+            interval_ms=interval_ms,
+        )
+        self._ticker_thread = QThread(self)
+        self._ticker_worker.moveToThread(self._ticker_thread)
+        self._ticker_thread.started.connect(self._ticker_worker.start)
+        self._ticker_worker.log.connect(self._log)
+        self._ticker_worker.updated.connect(self._on_ticker_updated)
+        self._ticker_worker.stopped.connect(self._ticker_thread.quit)
+        self._ticker_thread.finished.connect(self._ticker_worker.deleteLater)
+        self._ticker_thread.finished.connect(self._ticker_thread.deleteLater)
+        self._ticker_thread.start()
+        self._log("Ticker scan started")
+
+    def _stop_ticker_scan(self) -> None:
+        if self._ticker_worker:
+            self._ticker_worker.stop()
+        self._ticker_thread = None
+        self._ticker_worker = None
+
+    def _on_ticker_updated(self, result: TickerScanResult) -> None:
+        if not self._rows:
+            return
+        row_map = {row.pair: row for row in self._rows}
+        for update in result.updates:
+            row = row_map.get(update.pair)
+            if not row:
+                continue
+            row.best_buy_exchange = update.best_buy_exchange
+            row.buy_ask = update.buy_ask
+            row.best_sell_exchange = update.best_sell_exchange
+            row.sell_bid = update.sell_bid
+            row.spread_abs = update.spread_abs
+            row.spread_pct = update.spread_pct
+            row.volume_24h = update.volume_24h
+            row.status = "—"
+        self._table_model.notify_rows_updated()
+        self._last_updated = datetime.now().strftime("%H:%M:%S")
+        self._update_status()
+        self._log(
+            f"Ticker update: pairs={result.pair_count} ok={result.ok_count} fail={result.fail_count}"
+        )
 
     def _log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -358,6 +416,7 @@ class ScannerWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._cancel_market_discovery()
+        self._stop_ticker_scan()
         self._scanning = False
         self._update_status()
         super().closeEvent(event)
@@ -405,3 +464,51 @@ class MarketDiscoveryWorker(QObject):
 
     def _is_cancelled(self) -> bool:
         return self._cancelled
+
+
+class TickerScanWorker(QObject):
+    """Background worker for ticker scanning."""
+
+    updated = Signal(TickerScanResult)
+    log = Signal(str)
+    stopped = Signal()
+
+    def __init__(
+        self,
+        pair_exchanges: dict[str, list[str]],
+        max_pairs: int,
+        interval_ms: int,
+    ) -> None:
+        super().__init__()
+        self._pair_exchanges = pair_exchanges
+        self._max_pairs = max_pairs
+        self._interval_ms = interval_ms
+        self._timer: QTimer | None = None
+        self._stopped = False
+
+    def start(self) -> None:
+        if self._timer is None:
+            self._timer = QTimer()
+            self._timer.setInterval(self._interval_ms)
+            self._timer.timeout.connect(self._run_scan)
+        self._timer.start()
+        self._run_scan()
+
+    def stop(self) -> None:
+        self._stopped = True
+        if self._timer:
+            self._timer.stop()
+        self.stopped.emit()
+
+    def _run_scan(self) -> None:
+        if self._stopped:
+            return
+        try:
+            service = TickerScanService()
+            result = service.scan(self._pair_exchanges, self._max_pairs)
+        except Exception as exc:  # noqa: BLE001 - surface scan errors
+            self.log.emit(f"Ticker scan error: {exc}")
+            return
+        for error in result.errors:
+            self.log.emit(error)
+        self.updated.emit(result)
