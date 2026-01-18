@@ -137,6 +137,7 @@ class MainWindow(QMainWindow):
         self._pair_combo = QComboBox()
         self._pair_combo.addItems(["USDT/USDC", "BTC/USDT", "ETH/USDT", "SOL/USDT"])
         self._pair_combo.setCurrentText("USDT/USDC")
+        self._pair_combo.currentTextChanged.connect(self._on_pair_changed)
 
         self._exchange_button = QPushButton("Select Exchanges")
         self._exchange_button.clicked.connect(self._open_exchange_dialog)
@@ -315,6 +316,18 @@ class MainWindow(QMainWindow):
         self._stop_button.setEnabled(True)
         self._set_status("STARTING" if has_ws else "RUNNING")
         logger.info("Streaming started")
+
+    def _on_pair_changed(self, pair: str) -> None:
+        if not self._timer.isActive():
+            self._refresh_quotes()
+            return
+        self._ws_manager.stop_all()
+        has_ws = any(self._ws_manager.supports_exchange(exchange) for exchange in self._selected_exchanges)
+        if has_ws:
+            self._ensure_http_interval_for_ws()
+        self._ws_manager.start_for_selected_exchanges(pair, list(self._selected_exchanges))
+        self._set_status("STARTING" if has_ws else "RUNNING")
+        self._refresh_quotes()
 
     def _stop_stream(self) -> None:
         if not self._timer.isActive():
