@@ -60,6 +60,26 @@ class CcxtPriceProvider:
     def supported_exchanges(self) -> list[str]:
         return [definition.name for definition in self._EXCHANGES]
 
+    def resolve_symbol(self, exchange_name: str, pair: str) -> tuple[str | None, str | None]:
+        """Resolve the exchange-specific symbol for a given pair."""
+        exchange = self._exchanges.get(exchange_name)
+        if exchange is None:
+            return None, "Unsupported exchange"
+        now = datetime.now()
+        if exchange_name not in self._markets_loaded:
+            try:
+                exchange.load_markets()
+            except ccxt.BaseError as exc:
+                message = str(exc)
+                self._error_cooldown_until[exchange_name] = now + self.ERROR_COOLDOWN
+                self._log_exchange_error(exchange_name, message)
+                return None, message
+            self._markets_loaded.add(exchange_name)
+        symbol, status, error = self._resolve_symbol(exchange_name, exchange, pair, now)
+        if status in {"ERROR", "NO_SYMBOL"} or not symbol:
+            return None, error or "Symbol resolution error"
+        return symbol, None
+
     def fetch_quotes(self, pair: str, exchanges: list[str]) -> list[dict[str, Any]]:
         self._poll_market_futures()
         now = datetime.now()

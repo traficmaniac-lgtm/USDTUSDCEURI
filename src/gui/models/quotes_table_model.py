@@ -111,6 +111,42 @@ class QuotesTableModel(QAbstractTableModel):
         ]
         self.endResetModel()
 
+    def update_exchange_quote(self, quote: dict[str, Any]) -> None:
+        """Update a single exchange row with new quote data."""
+        exchange = str(quote.get("exchange", ""))
+        if not exchange:
+            return
+        for index, row in enumerate(self._rows):
+            if row.exchange != exchange:
+                continue
+            self._rows[index] = QuoteRow(
+                exchange=exchange,
+                bid=float(quote.get("bid", 0.0)),
+                ask=float(quote.get("ask", 0.0)),
+                last=float(quote.get("last", 0.0)),
+                spread=float(quote.get("spread", 0.0)),
+                timestamp=str(quote.get("timestamp", "")),
+                status=str(quote.get("status", "")),
+            )
+            top_left = self.index(index, 0)
+            bottom_right = self.index(index, self.columnCount() - 1)
+            self.dataChanged.emit(top_left, bottom_right)
+            return
+
+        self.beginInsertRows(QModelIndex(), len(self._rows), len(self._rows))
+        self._rows.append(
+            QuoteRow(
+                exchange=exchange,
+                bid=float(quote.get("bid", 0.0)),
+                ask=float(quote.get("ask", 0.0)),
+                last=float(quote.get("last", 0.0)),
+                spread=float(quote.get("spread", 0.0)),
+                timestamp=str(quote.get("timestamp", "")),
+                status=str(quote.get("status", "")),
+            )
+        )
+        self.endInsertRows()
+
     def _format_display(self, row: QuoteRow, column: int) -> str:
         if column == 0:
             return row.exchange
