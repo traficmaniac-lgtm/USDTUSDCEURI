@@ -134,10 +134,12 @@ class PairAnalysisWindow(QMainWindow):
         self._ws_entry_map: dict[str, PairExchangeTicker] = {}
         self._fallback_timer: QTimer | None = None
         self._heartbeat_timer: QTimer | None = None
+        self._http_timer: QTimer | None = None
         self._ws_stale_ms = 3000
         self._slow_threshold_ms = 5000
         self._fallback_active = False
         self._last_summary_key: tuple[float | None, float | None] | None = None
+        self._last_http_ts: float | None = None
         self._update_controller = get_update_controller()
 
         self.setWindowTitle(f"Анализ пары: {symbol}")
@@ -300,6 +302,7 @@ class PairAnalysisWindow(QMainWindow):
         self._ws_worker.start(self._run_id)
         self._start_fallback_timer()
         self._start_heartbeat_timer()
+        self._start_http_timer()
         self._start_button.setEnabled(False)
         self._stop_button.setEnabled(True)
         self._bad_updates_streak = 0
@@ -311,6 +314,7 @@ class PairAnalysisWindow(QMainWindow):
             self._ws_worker.stop()
         self._stop_fallback_timer()
         self._stop_heartbeat_timer()
+        self._stop_http_timer()
         self._fallback_active = False
         self._latency_label.setText("—")
         self._slow_update = False
@@ -325,6 +329,7 @@ class PairAnalysisWindow(QMainWindow):
             self._ws_worker.stop()
         self._stop_fallback_timer()
         self._stop_heartbeat_timer()
+        self._stop_http_timer()
         self._fallback_active = False
         self._latency_label.setText("—")
         self._slow_update = False
@@ -343,6 +348,8 @@ class PairAnalysisWindow(QMainWindow):
         if run_id != self._run_id:
             return
         self._in_flight = False
+        self._fallback_active = False
+        self._last_http_ts = time.monotonic()
         self._finalize_refresh(source="HTTP")
         self._apply_snapshot(snapshot, source="HTTP")
 
@@ -350,6 +357,8 @@ class PairAnalysisWindow(QMainWindow):
         if run_id != self._run_id:
             return
         self._in_flight = False
+        self._fallback_active = False
+        self._last_http_ts = time.monotonic()
         self._finalize_refresh(source="HTTP")
         self._set_analysis_status("ERROR")
         self._add_history_line(
@@ -424,8 +433,6 @@ class PairAnalysisWindow(QMainWindow):
             status = "LIVE"
         else:
             status = "STALE"
-        if source == "HTTP":
-            status = "STALE"
         self._set_analysis_status(status)
 
     def _update_table(
@@ -497,11 +504,18 @@ class PairAnalysisWindow(QMainWindow):
             self._fallback_timer.stop()
 
     def _start_http_fallback(self, reason: str) -> None:
+        self._request_http_snapshot(reason=reason, force=False)
+
+    def _request_http_snapshot(self, reason: str, force: bool) -> None:
         if self._in_flight:
             return
         if self._ws_last_update_ts is not None:
             delay_ms = (time.monotonic() - self._ws_last_update_ts) * 1000
-            if delay_ms < self._ws_stale_ms:
+            if not force and delay_ms < self._ws_stale_ms:
+                return
+        if not force and self._last_http_ts is not None:
+            elapsed_s = time.monotonic() - self._last_http_ts
+            if elapsed_s * 1000 < self._interval_ms:
                 return
         self._in_flight = True
         self._fallback_active = True
@@ -550,6 +564,23 @@ class PairAnalysisWindow(QMainWindow):
             self._heartbeat_timer.stop()
         self._heartbeat_label.setText("—")
         self._delay_label.setText("—")
+
+    def _start_http_timer(self) -> None:
+        if self._http_timer is None:
+            self._http_timer = QTimer(self)
+            self._http_timer.setInterval(self._interval_ms)
+            self._http_timer.timeout.connect(self._on_http_timer)
+        self._http_timer.start()
+        self._on_http_timer()
+
+    def _stop_http_timer(self) -> None:
+        if self._http_timer:
+            self._http_timer.stop()
+
+    def _on_http_timer(self) -> None:
+        if self._start_button.isEnabled():
+            return
+        self._request_http_snapshot(reason="interval", force=True)
 
     def _update_heartbeat(self) -> None:
         if self._ws_last_update_ts is None:
