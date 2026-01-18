@@ -3,3 +3,4 @@ ccxt
 httpx
 anyio
 loguru
+websocket-client
