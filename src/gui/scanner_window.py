@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -26,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .models.scanner_table_model import ScannerRow, ScannerTableModel
+from .pair_analysis_window import PairAnalysisWindow
 from ..scanner.market_discovery import MarketDiscoveryResult, MarketDiscoveryService
 from ..scanner.ticker_scan import TickerScanResult, TickerScanService
 
@@ -63,6 +63,7 @@ class ScannerWindow(QMainWindow):
         self._ticker_worker: TickerScanWorker | None = None
         self._pair_exchanges: dict[str, list[str]] = {}
         self._selected_exchanges_count = 0
+        self._analysis_windows: dict[str, PairAnalysisWindow] = {}
 
         self._build_ui()
         self._log("Окно сканера открыто")
@@ -313,12 +314,17 @@ class ScannerWindow(QMainWindow):
         if not (0 <= source_index.row() < len(self._profit_rows)):
             return
         pair = self._profit_rows[source_index.row()].pair
-        self._log(f"Открыть анализ: {pair}")
-        QMessageBox.information(
-            self,
-            "Анализ пары",
-            "Окно анализа будет добавлено на следующем этапе",
-        )
+        existing = self._analysis_windows.get(pair)
+        if existing and not existing.isHidden():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        selected_exchanges = self._selected_exchanges()
+        window = PairAnalysisWindow(pair, selected_exchanges)
+        window.destroyed.connect(lambda: self._analysis_windows.pop(pair, None))
+        self._analysis_windows[pair] = window
+        self._log(f"Открыто окно анализа: {pair}")
+        window.show()
 
     def _start_market_discovery(
         self,
