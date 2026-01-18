@@ -38,22 +38,36 @@ class TickerScanResult:
     errors: list[str]
 
 
+@dataclass(frozen=True)
+class PairExchangeTicker:
+    """Ticker snapshot for a single exchange in pair analysis."""
+
+    exchange: str
+    bid: float | None
+    ask: float | None
+    volume_24h: float | None
+    status: str
+
+
+EXCHANGE_MAP = {
+    "Binance": "binance",
+    "OKX": "okx",
+    "Bybit": "bybit",
+    "Gate.io": "gateio",
+    "KuCoin": "kucoin",
+    "Kraken": "kraken",
+    "Coinbase": "coinbase",
+    "Bitfinex": "bitfinex",
+    "Bitget": "bitget",
+    "HTX": "htx",
+}
+
+
 class TickerScanService:
     """Service that fetches tickers and computes spreads."""
 
     _default_outlier_pct = 5.0
-    _exchange_map = {
-        "Binance": "binance",
-        "OKX": "okx",
-        "Bybit": "bybit",
-        "Gate.io": "gateio",
-        "KuCoin": "kucoin",
-        "Kraken": "kraken",
-        "Coinbase": "coinbase",
-        "Bitfinex": "bitfinex",
-        "Bitget": "bitget",
-        "HTX": "htx",
-    }
+    _exchange_map = EXCHANGE_MAP
 
     def scan(
         self,
@@ -181,6 +195,69 @@ class TickerScanService:
             fail_count=fail_count,
             errors=errors,
         )
+
+    def fetch_pair_tickers(
+        self, pair: str, exchanges: Iterable[str]
+    ) -> tuple[list[PairExchangeTicker], list[str]]:
+        """Fetch tickers for a single pair across the selected exchanges."""
+        entries: list[PairExchangeTicker] = []
+        errors: list[str] = []
+        exchanges_cache: dict[str, ccxt.Exchange] = {}
+        for exchange_label in exchanges:
+            exchange_id = self._exchange_map.get(exchange_label, exchange_label.lower())
+            if not hasattr(ccxt, exchange_id):
+                errors.append(f"Exchange not found: {exchange_label}")
+                entries.append(
+                    PairExchangeTicker(
+                        exchange=exchange_label,
+                        bid=None,
+                        ask=None,
+                        volume_24h=None,
+                        status="NO API",
+                    )
+                )
+                continue
+            exchange = exchanges_cache.get(exchange_id)
+            if exchange is None:
+                exchange = getattr(ccxt, exchange_id)()
+                if exchange_id == "binance":
+                    options = getattr(exchange, "options", None)
+                    if not isinstance(options, dict):
+                        exchange.options = {}
+                    exchange.options["defaultType"] = "spot"
+                exchanges_cache[exchange_id] = exchange
+            try:
+                ticker = exchange.fetch_ticker(pair)
+            except Exception as exc:  # noqa: BLE001 - per-exchange errors are expected
+                message = f"Ticker error: {exchange_label} {pair}: {exc}"
+                errors.append(message)
+                logger.warning(message)
+                entries.append(
+                    PairExchangeTicker(
+                        exchange=exchange_label,
+                        bid=None,
+                        ask=None,
+                        volume_24h=None,
+                        status="ERR",
+                    )
+                )
+                continue
+            bid = _as_float(ticker.get("bid"))
+            ask = _as_float(ticker.get("ask"))
+            volume = _pick_volume(ticker)
+            status = "OK"
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                status = "NO DATA"
+            entries.append(
+                PairExchangeTicker(
+                    exchange=exchange_label,
+                    bid=bid,
+                    ask=ask,
+                    volume_24h=volume,
+                    status=status,
+                )
+            )
+        return entries, errors
 
 
 def _pick_volume(ticker: dict) -> float | None:
